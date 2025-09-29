@@ -671,12 +671,8 @@ async def main():
         
         logger.info("Multi-channel study bot started successfully")
 
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        
-        # Keep running
-        import asyncio
-        await asyncio.Event().wait()
+        # Start polling
+        await app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
         
     except Exception as e:
         logger.error(f"Error running bot: {e}")
