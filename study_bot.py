@@ -1,9 +1,10 @@
+
 import json
 import logging
 import os
 import re
 from pathlib import Path
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 import signal
 import sys
@@ -143,36 +144,95 @@ def get_all_channels() -> List[tuple]:
     
     return sorted(channels, key=lambda x: x[2], reverse=True)
 
+# ====== MENU HELPER ======
+def get_main_menu():
+    """Create the main menu keyboard"""
+    keyboard = [
+        [KeyboardButton("🔍 Search"), KeyboardButton("📚 List All")],
+        [KeyboardButton("📺 Channels"), KeyboardButton("📊 Statistics")],
+        [KeyboardButton("➕ Add Term"), KeyboardButton("🗑️ Delete Term")],
+        [KeyboardButton("ℹ️ Help")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 # ====== COMMANDS ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     msg = (
-        "📚 Multi-Channel Study Bot\n\n"
-        "I learn terms and definitions from messages in multiple channels.\n\n"
-        "**Commands:**\n"
-        "/add Term - Definition - Add a term manually\n"
-        "/search Term - Search for a term (across all channels)\n"
-        "/list - List all terms from all channels\n"
-        "/channels - Show all channels I'm learning from\n"
-        "/channel_stats - Show statistics per channel\n"
-        "/delete Term - Delete a term\n"
-        "/stats - Show overall statistics\n\n"
-        "**In channels:**\n"
-        "Just post messages in format:\n"
+        "📚 **Multi-Channel Study Bot**\n\n"
+        "Welcome! I help you learn and organize terms and definitions from multiple channels.\n\n"
+        "🎯 **Quick Start:**\n"
+        "• Use the menu buttons below to navigate\n"
+        "• Or just type any term to search for it!\n\n"
+        "📺 **In Channels:**\n"
+        "Add me to a channel and post messages like:\n"
         "• Term - Definition\n"
         "• Term: Definition\n"
         "• Term = Definition\n\n"
-        "I'll automatically learn from each channel separately!"
+        "I'll automatically learn from each channel!\n\n"
+        "👇 Use the menu below or type /help for more info"
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, reply_markup=get_main_menu())
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help command with detailed instructions"""
+    msg = (
+        "📖 **How to Use This Bot**\n\n"
+        "**🔍 Searching:**\n"
+        "• Click 'Search' button or type `/search Term`\n"
+        "• Or just type any term directly!\n\n"
+        "**➕ Adding Terms:**\n"
+        "• Click 'Add Term' button\n"
+        "• Or use: `/add Term - Definition`\n\n"
+        "**📚 Viewing Terms:**\n"
+        "• Click 'List All' to see all terms\n"
+        "• Click 'Channels' to see active channels\n"
+        "• Click 'Statistics' for detailed stats\n\n"
+        "**🗑️ Deleting:**\n"
+        "• Click 'Delete Term' button\n"
+        "• Or use: `/delete Term`\n\n"
+        "**📺 Channel Learning:**\n"
+        "Add me as admin to any channel and I'll automatically learn terms from posts in this format:\n"
+        "• `Term - Definition`\n"
+        "• `Term: Definition`\n"
+        "• `Term = Definition`\n\n"
+        "💡 **Tip:** You can search across all channels at once!"
+    )
+    await update.message.reply_text(msg, reply_markup=get_main_menu())
+
+async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete a term from all knowledge bases"""
+    # The try block here was empty and caused a syntax error, so it has been removed.
+    if not context.args:
+        await update.message.reply_text(
+            "🗑️ **Delete a Term**\n\n"
+            "Please type the term you want to delete.\n\n"
+            "**Example:** `Algorithm`",
+            reply_markup=get_main_menu()
+        )
+        return
+    
+    term = " ".join(context.args)
+    term_norm = normalize_term(term)
+    deleted_from = []
+    
+    default_knowledge = load_knowledge()
+    if term_norm in default_knowledge:
+        original = default_knowledge[term_norm].get("original_term", term)
+        del default_knowledge[term_norm]
+        save_knowledge(default_knowledge)
 
 async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually add a term"""
     try:
         if not context.args or len(context.args) < 2:
             await update.message.reply_text(
-                "Usage: /add Term - Definition\n"
-                "Example: /add Algorithm - A step-by-step procedure for solving a problem"
+                "📝 **Add a New Term**\n\n"
+                "**Format:** Term - Definition\n\n"
+                "**Example:**\n"
+                "`Algorithm - A step-by-step procedure for solving a problem`\n\n"
+                "Please send your term in the correct format:",
+                reply_markup=get_main_menu()
             )
             return
         
@@ -181,8 +241,9 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if not term or not definition:
             await update.message.reply_text(
-                "Could not parse term and definition. Use format:\n"
-                "/add Term - Definition"
+                "❌ Could not parse term and definition.\n\n"
+                "Please use format: `Term - Definition`",
+                reply_markup=get_main_menu()
             )
             return
         
@@ -199,7 +260,7 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "added": str(update.message.date),
                 "source": "manual"
             })
-            msg = f"✅ Added another definition for: **{term}**\nTotal definitions: {len(knowledge[term_norm]['definitions'])}"
+            msg = f"✅ Added another definition for: **{term}**\n\n📊 Total definitions: {len(knowledge[term_norm]['definitions'])}"
         else:
             knowledge[term_norm] = {
                 "original_term": term,
@@ -207,21 +268,26 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "added": str(update.message.date),
                 "related": []
             }
-            msg = f"✅ Added term: **{term}**"
+            msg = f"✅ **Term Added Successfully!**\n\n📚 **{term}**\n📝 {definition}"
         
         save_knowledge(knowledge)
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, reply_markup=get_main_menu())
         logger.info(f"Manual add - term: {term}")
         
     except Exception as e:
         logger.error(f"Error in add_term: {e}")
-        await update.message.reply_text("❌ Error adding term")
+        await update.message.reply_text("❌ Error adding term", reply_markup=get_main_menu())
 
 async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Search for a term across all channels"""
     try:
         if not context.args:
-            await update.message.reply_text("Usage: /search Term")
+            await update.message.reply_text(
+                "🔍 **Search for a Term**\n\n"
+                "Please type the term you want to search for.\n\n"
+                "**Example:** `Algorithm`",
+                reply_markup=get_main_menu()
+            )
             return
         
         query = " ".join(context.args)
@@ -253,7 +319,12 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error searching {kb_file}: {e}")
         
         if not all_results:
-            await update.message.reply_text(f"❌ No results found for: **{query}**")
+            await update.message.reply_text(
+                f"❌ **No Results Found**\n\n"
+                f"No matches for: **{query}**\n\n"
+                f"Try a different search term or add it using 'Add Term' button.",
+                reply_markup=get_main_menu()
+            )
             return
         
         all_results.sort(key=lambda x: x[2], reverse=True)
@@ -268,12 +339,12 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(unique_results) >= 5:
                     break
         
-        msg = f"🔍 Search results for '**{query}**':\n\n"
+        msg = f"🔍 **Search Results for '{query}'**\n\n"
         
         for i, (term, data, score, channel_name, channel_id) in enumerate(unique_results, 1):
             original = data.get("original_term", term)
             
-            msg += f"{i}. **{original}**"
+            msg += f"**{i}. {original}**"
             if channel_name != "manual":
                 msg += f" 📺 {channel_name}"
             msg += "\n"
@@ -285,25 +356,25 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if len(definitions) > 1:
                         msg += f"   {j}. {def_text}\n"
                     else:
-                        msg += f"   {def_text}\n"
+                        msg += f"   📝 {def_text}\n"
             else:
                 definition = data.get("definition", "No definition")
-                msg += f"   {definition}\n"
+                msg += f"   📝 {definition}\n"
             
             related = data.get("related", [])
             if related:
-                msg += f"   Related: {', '.join(related)}\n"
+                msg += f"   🔗 Related: {', '.join(related)}\n"
             
             msg += "\n"
         
         if len(msg) > 4000:
             msg = msg[:4000] + "...\n\n⚠️ (Results truncated)"
         
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, reply_markup=get_main_menu())
         
     except Exception as e:
         logger.error(f"Error in search_term: {e}")
-        await update.message.reply_text("❌ Error searching term")
+        await update.message.reply_text("❌ Error searching term", reply_markup=get_main_menu())
 
 async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all terms from all channels"""
@@ -337,30 +408,37 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error loading {kb_file}: {e}")
         
         if not all_terms:
-            await update.message.reply_text("📭 Knowledge base is empty")
+            await update.message.reply_text(
+                "📭 **Knowledge Base is Empty**\n\n"
+                "No terms found. Start adding terms or add me to a channel!",
+                reply_markup=get_main_menu()
+            )
             return
         
         sorted_terms = sorted(all_terms.items())
-        
-        msg = f"📚 All terms ({len(sorted_terms)}):\n\n"
         
         if len(sorted_terms) > 50:
             chunk_size = 50
             chunks = [sorted_terms[i:i+chunk_size] for i in range(0, len(sorted_terms), chunk_size)]
             
             for chunk_idx, chunk in enumerate(chunks, 1):
-                chunk_msg = f"📚 Terms (part {chunk_idx}/{len(chunks)}):\n\n"
+                chunk_msg = f"📚 **All Terms (Part {chunk_idx}/{len(chunks)})**\n\n"
                 for i, (term, source) in enumerate(chunk, (chunk_idx-1)*chunk_size + 1):
                     chunk_msg += f"{i}. {term} 📺 {source}\n"
-                await update.message.reply_text(chunk_msg)
+                
+                if chunk_idx == len(chunks):
+                    await update.message.reply_text(chunk_msg, reply_markup=get_main_menu())
+                else:
+                    await update.message.reply_text(chunk_msg)
         else:
+            msg = f"📚 **All Terms ({len(sorted_terms)} total)**\n\n"
             for i, (term, source) in enumerate(sorted_terms, 1):
                 msg += f"{i}. {term} 📺 {source}\n"
-            await update.message.reply_text(msg)
+            await update.message.reply_text(msg, reply_markup=get_main_menu())
         
     except Exception as e:
         logger.error(f"Error in list_terms: {e}")
-        await update.message.reply_text("❌ Error listing terms")
+        await update.message.reply_text("❌ Error listing terms", reply_markup=get_main_menu())
 
 async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show all channels the bot is learning from"""
@@ -368,21 +446,30 @@ async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channels = get_all_channels()
         
         if not channels:
-            await update.message.reply_text("📭 No channels found. Add me to a channel to start learning!")
+            await update.message.reply_text(
+                "📭 **No Active Channels**\n\n"
+                "Add me to a channel as an admin to start learning!\n\n"
+                "📌 **How to add me:**\n"
+                "1. Go to your channel settings\n"
+                "2. Add administrators\n"
+                "3. Search for this bot and add it\n"
+                "4. Post terms in format: `Term - Definition`",
+                reply_markup=get_main_menu()
+            )
             return
         
-        msg = f"📺 Active Channels ({len(channels)}):\n\n"
+        msg = f"📺 **Active Channels ({len(channels)})**\n\n"
         
         for i, (channel_id, channel_name, term_count) in enumerate(channels, 1):
-            msg += f"{i}. **{channel_name}**\n"
-            msg += f"   ID: `{channel_id}`\n"
-            msg += f"   Terms: {term_count}\n\n"
+            msg += f"**{i}. {channel_name}**\n"
+            msg += f"   📊 Terms: {term_count}\n"
+            msg += f"   🆔 ID: `{channel_id}`\n\n"
         
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, reply_markup=get_main_menu())
         
     except Exception as e:
         logger.error(f"Error in show_channels: {e}")
-        await update.message.reply_text("❌ Error showing channels")
+        await update.message.reply_text("❌ Error showing channels", reply_markup=get_main_menu())
 
 async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed statistics per channel"""
@@ -390,10 +477,13 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channels = get_all_channels()
         
         if not channels:
-            await update.message.reply_text("📭 No channels found")
+            await update.message.reply_text(
+                "📭 No channels found",
+                reply_markup=get_main_menu()
+            )
             return
         
-        msg = "📊 Channel Statistics:\n\n"
+        msg = "📊 **Detailed Channel Statistics**\n\n"
         
         total_terms = 0
         total_definitions = 0
@@ -409,26 +499,31 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_terms += term_count
             total_definitions += def_count
             
-            msg += f"{i}. **{channel_name}**\n"
-            msg += f"   Terms: {term_count}\n"
-            msg += f"   Definitions: {def_count}\n"
-            msg += f"   Avg: {def_count/term_count:.1f} def/term\n\n"
+            msg += f"**{i}. {channel_name}**\n"
+            msg += f"   📚 Terms: {term_count}\n"
+            msg += f"   📝 Definitions: {def_count}\n"
+            msg += f"   📈 Avg: {def_count/term_count:.1f} def/term\n\n"
         
-        msg += f"**Total:**\n"
-        msg += f"Terms: {total_terms}\n"
-        msg += f"Definitions: {total_definitions}\n"
+        msg += f"**📊 Overall Total:**\n"
+        msg += f"   📚 Terms: {total_terms}\n"
+        msg += f"   📝 Definitions: {total_definitions}\n"
         
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, reply_markup=get_main_menu())
         
     except Exception as e:
         logger.error(f"Error in channel_stats: {e}")
-        await update.message.reply_text("❌ Error getting channel statistics")
+        await update.message.reply_text("❌ Error getting channel statistics", reply_markup=get_main_menu())
 
 async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete a term from all knowledge bases"""
     try:
         if not context.args:
-            await update.message.reply_text("Usage: /delete Term")
+            await update.message.reply_text(
+                "🗑️ **Delete a Term**\n\n"
+                "Please type the term you want to delete.\n\n"
+                "**Example:** `Algorithm`",
+                reply_markup=get_main_menu()
+            )
             return
         
         term = " ".join(context.args)
@@ -459,16 +554,18 @@ async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error processing {kb_file}: {e}")
         
         if deleted_from:
-            msg = f"✅ Deleted term '**{term}**' from:\n" + "\n".join(f"• {source}" for source in deleted_from)
+            msg = f"✅ **Term Deleted Successfully!**\n\n"
+            msg += f"🗑️ Deleted '**{term}**' from:\n"
+            msg += "\n".join(f"   • {source}" for source in deleted_from)
             logger.info(f"Deleted term: {term} from {', '.join(deleted_from)}")
         else:
-            msg = f"❌ Term not found: **{term}**"
+            msg = f"❌ **Term Not Found**\n\nNo matches for: **{term}**"
         
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, reply_markup=get_main_menu())
         
     except Exception as e:
         logger.error(f"Error in delete_term: {e}")
-        await update.message.reply_text("❌ Error deleting term")
+        await update.message.reply_text("❌ Error deleting term", reply_markup=get_main_menu())
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show overall statistics"""
@@ -503,19 +600,21 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Error processing {kb_file}: {e}")
         
-        msg = "📊 **Knowledge Base Statistics:**\n\n"
-        msg += f"📺 Active Channels: {total_channels}\n"
-        msg += f"📚 Total Terms: {total_terms}\n"
-        msg += f"📝 Total Definitions: {total_definitions}\n"
+        msg = "📊 **Knowledge Base Statistics**\n\n"
+        msg += f"📺 Active Channels: **{total_channels}**\n"
+        msg += f"📚 Total Terms: **{total_terms}**\n"
+        msg += f"📝 Total Definitions: **{total_definitions}**\n"
         
         if total_terms > 0:
-            msg += f"📈 Avg Definitions/Term: {total_definitions/total_terms:.1f}\n"
+            msg += f"📈 Avg Definitions/Term: **{total_definitions/total_terms:.1f}**\n"
         
-        await update.message.reply_text(msg)
+        msg += f"\n💡 Keep learning! Add more channels or terms."
+        
+        await update.message.reply_text(msg, reply_markup=get_main_menu())
         
     except Exception as e:
         logger.error(f"Error in stats: {e}")
-        await update.message.reply_text("❌ Error getting statistics")
+        await update.message.reply_text("❌ Error getting statistics", reply_markup=get_main_menu())
 
 async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Automatically extract terms from channel messages - multi-channel version"""
@@ -563,7 +662,7 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"Error handling channel message: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle direct messages - treat as search queries"""
+    """Handle direct messages - treat as search queries or menu buttons"""
     try:
         if not update.message or not update.message.text:
             return
@@ -571,12 +670,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.text.startswith('/'):
             return
         
-        query = update.message.text
+        text = update.message.text.strip()
+        
+        # Handle menu button clicks
+        if text == "🔍 Search":
+            await update.message.reply_text(
+                "🔍 **Search for a Term**\n\n"
+                "Please type the term you want to search for.\n\n"
+                "**Example:** `Algorithm`",
+                reply_markup=get_main_menu()
+            )
+            return
+        
+        elif text == "📚 List All":
+            await list_terms(update, context)
+            return
+        
+        elif text == "📺 Channels":
+            await show_channels(update, context)
+            return
+        
+        elif text == "📊 Statistics":
+            await stats(update, context)
+            return
+        
+        elif text == "➕ Add Term":
+            await update.message.reply_text(
+                "📝 **Add a New Term**\n\n"
+                "**Format:** `/add Term - Definition`\n\n"
+                "**Example:**\n"
+                "`/add Algorithm - A step-by-step procedure for solving a problem`\n\n"
+                "Please send your term in the correct format:",
+                reply_markup=get_main_menu()
+            )
+            return
+        
+        elif text == "🗑️ Delete Term":
+            await update.message.reply_text(
+                "🗑️ **Delete a Term**\n\n"
+                "**Format:** `/delete Term`\n\n"
+                "**Example:**\n"
+                "`/delete Algorithm`\n\n"
+                "Please send the term you want to delete:",
+                reply_markup=get_main_menu()
+            )
+            return
+        
+        elif text == "ℹ️ Help":
+            await help_command(update, context)
+            return
+        
+        # If not a menu button, treat as a search query
+        query = text
         context.args = query.split()
         await search_term(update, context)
         
     except Exception as e:
         logger.error(f"Error handling message: {e}")
+        await update.message.reply_text(
+            "❌ An error occurred. Please try again.",
+            reply_markup=get_main_menu()
+        )
 
 # ====== MAIN ======
 def main():
@@ -591,6 +745,7 @@ def main():
 
         # Add command handlers
         app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
         app.add_handler(CommandHandler("add", add_term))
         app.add_handler(CommandHandler("search", search_term))
         app.add_handler(CommandHandler("list", list_terms))
