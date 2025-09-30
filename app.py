@@ -11,16 +11,10 @@ from typing import Dict, List
 from difflib import get_close_matches
 
 # ====== CONFIG ======
-# WARNING: Hardcoding tokens is a security risk!
-# If you push this to GitHub, your token will be exposed and anyone can control your bot.
-# Better approach: Use environment variables in Railway dashboard
-TOKEN = "8373988253:AAFIexsmj8bXJ7X4PtU4zmutYYljWNLDeMc"  # Replace with your actual token from @BotFather
-
-# Fallback to environment variable if token not hardcoded
-if TOKEN == "YOUR_BOT_TOKEN_HERE":
-    TOKEN = os.getenv("STUDY_BOT_TOKEN")
-    if not TOKEN:
-        raise ValueError("Please set your bot token in the code or STUDY_BOT_TOKEN environment variable")
+# Use environment variable for Railway deployment
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("Please set TELEGRAM_BOT_TOKEN environment variable in Railway dashboard")
 
 # ====== LOGGING ======
 logging.basicConfig(
@@ -48,7 +42,6 @@ def load_knowledge(channel_id: int = None) -> Dict:
     """Load knowledge base for specific channel"""
     try:
         if channel_id is None:
-            # Load default knowledge base for backward compatibility
             filename = "knowledge_base.json"
         else:
             filename = get_knowledge_file(channel_id)
@@ -86,11 +79,9 @@ def extract_definition(text: str) -> tuple:
     - "Term = definition"
     - "**Term** - definition"
     """
-    # Remove markdown formatting
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'__(.+?)__', r'\1', text)
     
-    # Try different separators
     separators = [' - ', ': ', ' = ', ' – ', ' — ']
     
     for sep in separators:
@@ -108,33 +99,29 @@ def search_knowledge(query: str, knowledge: Dict) -> List[tuple]:
     """Search for terms matching the query"""
     query_norm = normalize_term(query)
     results = []
-    seen_terms = set()  # Track terms we've already added
+    seen_terms = set()
     
-    # Exact match
     if query_norm in knowledge:
         results.append((query_norm, knowledge[query_norm], 1.0))
         seen_terms.add(query_norm)
     
-    # Partial matches
     for term, data in knowledge.items():
-        if term in seen_terms:  # Skip if already added
+        if term in seen_terms:
             continue
         if query_norm in term or term in query_norm:
             score = 0.8
             results.append((term, data, score))
             seen_terms.add(term)
     
-    # Fuzzy matches
     all_terms = list(knowledge.keys())
     close_matches = get_close_matches(query_norm, all_terms, n=3, cutoff=0.6)
     for match in close_matches:
-        if match not in seen_terms:  # Skip if already added
+        if match not in seen_terms:
             results.append((match, knowledge[match], 0.6))
             seen_terms.add(match)
     
-    # Sort by score
     results.sort(key=lambda x: x[2], reverse=True)
-    return results[:5]  # Return top 5 matches
+    return results[:5]
 
 def get_all_channels() -> List[tuple]:
     """Get list of all channels with knowledge bases"""
@@ -145,10 +132,8 @@ def get_all_channels() -> List[tuple]:
         for kb_file in knowledge_dir.glob("knowledge_*.json"):
             try:
                 channel_id = int(kb_file.stem.split("_")[1])
-                # Load to get channel name if available
                 knowledge = load_knowledge(channel_id)
                 if knowledge:
-                    # Try to get channel name from first term
                     first_term = next(iter(knowledge.values()), {})
                     channel_name = first_term.get("channel", f"Channel {channel_id}")
                     term_count = len(knowledge)
@@ -201,14 +186,11 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # Use default knowledge base for manual additions
         knowledge = load_knowledge()
         term_norm = normalize_term(term)
         
         if term_norm in knowledge:
-            # Add new definition to list
             if "definitions" not in knowledge[term_norm]:
-                # Migrate old format
                 old_def = knowledge[term_norm].get("definition", "")
                 knowledge[term_norm]["definitions"] = [{"text": old_def, "added": knowledge[term_norm].get("added", "")}]
             
@@ -244,18 +226,15 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         query = " ".join(context.args)
         
-        # Search across all channels
         all_results = []
         knowledge_dir = Path("knowledge_bases")
         
-        # Also check default knowledge base
         default_knowledge = load_knowledge()
         if default_knowledge:
             default_results = search_knowledge(query, default_knowledge)
             for term, data, score in default_results:
                 all_results.append((term, data, score, "manual", 0))
         
-        # Search channel-specific knowledge bases
         if knowledge_dir.exists():
             for kb_file in knowledge_dir.glob("knowledge_*.json"):
                 try:
@@ -263,7 +242,6 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     knowledge = load_knowledge(channel_id)
                     if knowledge:
                         channel_results = search_knowledge(query, knowledge)
-                        # Get channel name from first result
                         channel_name = None
                         if knowledge:
                             first_term = next(iter(knowledge.values()), {})
@@ -278,10 +256,8 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ No results found for: **{query}**")
             return
         
-        # Sort by score and remove duplicates (keep highest scoring)
         all_results.sort(key=lambda x: x[2], reverse=True)
         
-        # Remove duplicate terms (keep first occurrence which has highest score)
         seen_terms = set()
         unique_results = []
         for result in all_results:
@@ -289,7 +265,7 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if term not in seen_terms:
                 unique_results.append(result)
                 seen_terms.add(term)
-                if len(unique_results) >= 5:  # Limit to top 5
+                if len(unique_results) >= 5:
                     break
         
         msg = f"🔍 Search results for '**{query}**':\n\n"
@@ -302,7 +278,6 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += f" 📺 {channel_name}"
             msg += "\n"
             
-            # Handle both old and new format
             if "definitions" in data:
                 definitions = data["definitions"]
                 for j, def_item in enumerate(definitions, 1):
@@ -312,18 +287,15 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         msg += f"   {def_text}\n"
             else:
-                # Old format
                 definition = data.get("definition", "No definition")
                 msg += f"   {definition}\n"
             
-            # Add related terms if available
             related = data.get("related", [])
             if related:
                 msg += f"   Related: {', '.join(related)}\n"
             
             msg += "\n"
         
-        # Split message if too long
         if len(msg) > 4000:
             msg = msg[:4000] + "...\n\n⚠️ (Results truncated)"
         
@@ -338,13 +310,11 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         all_terms = {}
         
-        # Load default knowledge base
         default_knowledge = load_knowledge()
         for term, data in default_knowledge.items():
             original = data.get("original_term", term)
             all_terms[original] = "Manual"
         
-        # Load from all channels
         knowledge_dir = Path("knowledge_bases")
         if knowledge_dir.exists():
             for kb_file in knowledge_dir.glob("knowledge_*.json"):
@@ -352,7 +322,6 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     channel_id = int(kb_file.stem.split("_")[1])
                     knowledge = load_knowledge(channel_id)
                     
-                    # Get channel name
                     channel_name = f"Channel {channel_id}"
                     if knowledge:
                         first_term = next(iter(knowledge.values()), {})
@@ -375,7 +344,6 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         msg = f"📚 All terms ({len(sorted_terms)}):\n\n"
         
-        # Split into chunks if too many
         if len(sorted_terms) > 50:
             chunk_size = 50
             chunks = [sorted_terms[i:i+chunk_size] for i in range(0, len(sorted_terms), chunk_size)]
@@ -433,7 +401,6 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, (channel_id, channel_name, term_count) in enumerate(channels, 1):
             knowledge = load_knowledge(channel_id)
             
-            # Count total definitions
             def_count = sum(
                 len(data.get("definitions", [data.get("definition", "")]))
                 for data in knowledge.values()
@@ -468,7 +435,6 @@ async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
         term_norm = normalize_term(term)
         deleted_from = []
         
-        # Check default knowledge base
         default_knowledge = load_knowledge()
         if term_norm in default_knowledge:
             original = default_knowledge[term_norm].get("original_term", term)
@@ -476,7 +442,6 @@ async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_knowledge(default_knowledge)
             deleted_from.append("Manual")
         
-        # Check all channels
         knowledge_dir = Path("knowledge_bases")
         if knowledge_dir.exists():
             for kb_file in knowledge_dir.glob("knowledge_*.json"):
@@ -512,7 +477,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_definitions = 0
         total_channels = 0
         
-        # Count from default knowledge base
         default_knowledge = load_knowledge()
         if default_knowledge:
             total_terms += len(default_knowledge)
@@ -521,7 +485,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for data in default_knowledge.values()
             )
         
-        # Count from all channels
         knowledge_dir = Path("knowledge_bases")
         if knowledge_dir.exists():
             channel_files = list(knowledge_dir.glob("knowledge_*.json"))
@@ -567,15 +530,12 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
         if not text:
             return
         
-        # Try to extract term and definition
         term, definition = extract_definition(text)
         
         if term and definition:
-            # Load knowledge base for THIS specific channel
             knowledge = load_knowledge(channel_id)
             term_norm = normalize_term(term)
             
-            # Add or update term
             if term_norm in knowledge:
                 if "definitions" not in knowledge[term_norm]:
                     old_def = knowledge[term_norm].get("definition", "")
@@ -597,7 +557,6 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
                 }
                 logger.info(f"[{channel_name}] Auto-learned new term: {term}")
             
-            # Save to channel-specific knowledge base
             save_knowledge(knowledge, channel_id)
         
     except Exception as e:
@@ -609,34 +568,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
         
-        # Ignore commands
         if update.message.text.startswith('/'):
             return
         
         query = update.message.text
-        
-        # Just call search_term with the query
         context.args = query.split()
         await search_term(update, context)
         
     except Exception as e:
         logger.error(f"Error handling message: {e}")
 
-# ====== SIGNAL HANDLERS ======
-def signal_handler(signum, frame):
-    logger.info(f"Received signal {signum}, shutting down...")
-    sys.exit(0)
-
 # ====== MAIN ======
-async def main():
+def main():
+    """Main function to run the bot"""
     global app
     
     logger.info("Starting multi-channel study bot...")
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
     try:
+        # Create application
         app = Application.builder().token(TOKEN).build()
 
         # Add command handlers
@@ -655,44 +605,13 @@ async def main():
         # Handle direct messages as search queries
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
 
-        # Set commands
-        commands = [
-            BotCommand("add", "Add a term manually"),
-            BotCommand("search", "Search for a term"),
-            BotCommand("list", "List all terms"),
-            BotCommand("channels", "Show all channels"),
-            BotCommand("channel_stats", "Statistics per channel"),
-            BotCommand("delete", "Delete a term"),
-            BotCommand("stats", "Show statistics"),
-        ]
-        
-        await app.bot.set_my_commands(commands)
-        await app.initialize()
-        
+        # Start the bot
         logger.info("Multi-channel study bot started successfully")
-
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        
-        # Keep running
-        import asyncio
-        await asyncio.Event().wait()
+        app.run_polling(drop_pending_updates=True)
         
     except Exception as e:
         logger.error(f"Error running bot: {e}")
         raise
-    finally:
-        logger.info("Shutting down bot...")
-        if app:
-            await app.stop()
-            await app.shutdown()
 
 if __name__ == "__main__":
-    try:
-        import asyncio
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+    main()
