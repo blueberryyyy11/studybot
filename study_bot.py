@@ -1,4 +1,3 @@
-
 import json
 import logging
 import os
@@ -6,13 +5,13 @@ import re
 from pathlib import Path
 from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.constants import ParseMode
 import signal
 import sys
 from typing import Dict, List
 from difflib import get_close_matches
 
 # ====== CONFIG ======
-# Use environment variable for Railway deployment
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise ValueError("Please set TELEGRAM_BOT_TOKEN environment variable in Railway dashboard")
@@ -31,6 +30,14 @@ logger = logging.getLogger(__name__)
 
 # ====== GLOBAL VARIABLES ======
 app = None
+
+# ====== HELPER FUNCTION FOR MARKDOWN ESCAPING ======
+def escape_markdown(text: str) -> str:
+    """Escape special characters for MarkdownV2"""
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    for char in special_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
 
 # ====== DATA HELPERS ======
 def get_knowledge_file(channel_id: int) -> str:
@@ -73,13 +80,7 @@ def normalize_term(term: str) -> str:
     return term.lower().strip()
 
 def extract_definition(text: str) -> tuple:
-    """
-    Extract term and definition from various formats:
-    - "Term - definition"
-    - "Term: definition"
-    - "Term = definition"
-    - "**Term** - definition"
-    """
+    """Extract term and definition from various formats"""
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'__(.+?)__', r'\1', text)
     
@@ -159,92 +160,70 @@ def get_main_menu():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     msg = (
-        "📚 **Multi-Channel Study Bot**\n\n"
-        "Welcome! I help you learn and organize terms and definitions from multiple channels.\n\n"
-        "🎯 **Quick Start:**\n"
+        "📚 *Multi\\-Channel Study Bot*\n\n"
+        "Welcome\\! I help you learn and organize terms and definitions from multiple channels\\.\n\n"
+        "🎯 *Quick Start:*\n"
         "• Use the menu buttons below to navigate\n"
-        "• Or just type any term to search for it!\n\n"
-        "📺 **In Channels:**\n"
+        "• Or just type any term to search for it\\!\n\n"
+        "📺 *In Channels:*\n"
         "Add me to a channel and post messages like:\n"
-        "• Term - Definition\n"
+        "• Term \\- Definition\n"
         "• Term: Definition\n"
-        "• Term = Definition\n\n"
-        "I'll automatically learn from each channel!\n\n"
+        "• Term \\= Definition\n\n"
+        "I'll automatically learn from each channel\\!\n\n"
         "👇 Use the menu below or type /help for more info"
     )
-    await update.message.reply_text(msg, reply_markup=get_main_menu())
+    await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command with detailed instructions"""
     msg = (
-        "📖 **How to Use This Bot**\n\n"
-        "**🔍 Searching:**\n"
+        "📖 *How to Use This Bot*\n\n"
+        "*🔍 Searching:*\n"
         "• Click 'Search' button or type `/search Term`\n"
-        "• Or just type any term directly!\n\n"
-        "**➕ Adding Terms:**\n"
+        "• Or just type any term directly\\!\n\n"
+        "*➕ Adding Terms:*\n"
         "• Click 'Add Term' button\n"
-        "• Or use: `/add Term - Definition`\n\n"
-        "**📚 Viewing Terms:**\n"
+        "• Or use: `/add Term \\- Definition`\n\n"
+        "*📚 Viewing Terms:*\n"
         "• Click 'List All' to see all terms\n"
         "• Click 'Channels' to see active channels\n"
         "• Click 'Statistics' for detailed stats\n\n"
-        "**🗑️ Deleting:**\n"
+        "*🗑️ Deleting:*\n"
         "• Click 'Delete Term' button\n"
         "• Or use: `/delete Term`\n\n"
-        "**📺 Channel Learning:**\n"
+        "*📺 Channel Learning:*\n"
         "Add me as admin to any channel and I'll automatically learn terms from posts in this format:\n"
-        "• `Term - Definition`\n"
+        "• `Term \\- Definition`\n"
         "• `Term: Definition`\n"
-        "• `Term = Definition`\n\n"
-        "💡 **Tip:** You can search across all channels at once!"
+        "• `Term \\= Definition`\n\n"
+        "💡 *Tip:* You can search across all channels at once\\!"
     )
-    await update.message.reply_text(msg, reply_markup=get_main_menu())
-
-async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete a term from all knowledge bases"""
-    # The try block here was empty and caused a syntax error, so it has been removed.
-    if not context.args:
-        await update.message.reply_text(
-            "🗑️ **Delete a Term**\n\n"
-            "Please type the term you want to delete.\n\n"
-            "**Example:** `Algorithm`",
-            reply_markup=get_main_menu()
-        )
-        return
-    
-    term = " ".join(context.args)
-    term_norm = normalize_term(term)
-    deleted_from = []
-    
-    default_knowledge = load_knowledge()
-    if term_norm in default_knowledge:
-        original = default_knowledge[term_norm].get("original_term", term)
-        del default_knowledge[term_norm]
-        save_knowledge(default_knowledge)
+    await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually add a term"""
     try:
         if not context.args or len(context.args) < 2:
-            await update.message.reply_text(
-                "📝 **Add a New Term**\n\n"
-                "**Format:** Term - Definition\n\n"
-                "**Example:**\n"
-                "`Algorithm - A step-by-step procedure for solving a problem`\n\n"
-                "Please send your term in the correct format:",
-                reply_markup=get_main_menu()
+            msg = (
+                "📝 *Add a New Term*\n\n"
+                "*Format:* Term \\- Definition\n\n"
+                "*Example:*\n"
+                "`Algorithm \\- A step\\-by\\-step procedure for solving a problem`\n\n"
+                "Please send your term in the correct format:"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         text = " ".join(context.args)
         term, definition = extract_definition(text)
         
         if not term or not definition:
-            await update.message.reply_text(
-                "❌ Could not parse term and definition.\n\n"
-                "Please use format: `Term - Definition`",
-                reply_markup=get_main_menu()
+            msg = (
+                "❌ Could not parse term and definition\\.\n\n"
+                "Please use format: `Term \\- Definition`"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         knowledge = load_knowledge()
@@ -260,7 +239,7 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "added": str(update.message.date),
                 "source": "manual"
             })
-            msg = f"✅ Added another definition for: **{term}**\n\n📊 Total definitions: {len(knowledge[term_norm]['definitions'])}"
+            msg = f"✅ Added another definition for: *{escape_markdown(term)}*\n\n📊 Total definitions: {len(knowledge[term_norm]['definitions'])}"
         else:
             knowledge[term_norm] = {
                 "original_term": term,
@@ -268,10 +247,10 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "added": str(update.message.date),
                 "related": []
             }
-            msg = f"✅ **Term Added Successfully!**\n\n📚 **{term}**\n📝 {definition}"
+            msg = f"✅ *Term Added Successfully\\!*\n\n📚 *{escape_markdown(term)}*\n📝 {escape_markdown(definition)}"
         
         save_knowledge(knowledge)
-        await update.message.reply_text(msg, reply_markup=get_main_menu())
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         logger.info(f"Manual add - term: {term}")
         
     except Exception as e:
@@ -282,12 +261,12 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Search for a term across all channels"""
     try:
         if not context.args:
-            await update.message.reply_text(
-                "🔍 **Search for a Term**\n\n"
-                "Please type the term you want to search for.\n\n"
-                "**Example:** `Algorithm`",
-                reply_markup=get_main_menu()
+            msg = (
+                "🔍 *Search for a Term*\n\n"
+                "Please type the term you want to search for\\.\n\n"
+                "*Example:* `Algorithm`"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         query = " ".join(context.args)
@@ -319,12 +298,12 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error searching {kb_file}: {e}")
         
         if not all_results:
-            await update.message.reply_text(
-                f"❌ **No Results Found**\n\n"
-                f"No matches for: **{query}**\n\n"
-                f"Try a different search term or add it using 'Add Term' button.",
-                reply_markup=get_main_menu()
+            msg = (
+                f"❌ *No Results Found*\n\n"
+                f"No matches for: *{escape_markdown(query)}*\n\n"
+                f"Try a different search term or add it using 'Add Term' button\\."
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         all_results.sort(key=lambda x: x[2], reverse=True)
@@ -339,14 +318,14 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(unique_results) >= 5:
                     break
         
-        msg = f"🔍 **Search Results for '{query}'**\n\n"
+        msg = f"🔍 *Search Results for '{escape_markdown(query)}'*\n\n"
         
         for i, (term, data, score, channel_name, channel_id) in enumerate(unique_results, 1):
             original = data.get("original_term", term)
             
-            msg += f"**{i}. {original}**"
+            msg += f"*{i}\\. {escape_markdown(original)}*"
             if channel_name != "manual":
-                msg += f" 📺 {channel_name}"
+                msg += f" 📺 {escape_markdown(channel_name)}"
             msg += "\n"
             
             if "definitions" in data:
@@ -354,23 +333,24 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for j, def_item in enumerate(definitions, 1):
                     def_text = def_item.get("text", def_item) if isinstance(def_item, dict) else def_item
                     if len(definitions) > 1:
-                        msg += f"   {j}. {def_text}\n"
+                        msg += f"   {j}\\. {escape_markdown(def_text)}\n"
                     else:
-                        msg += f"   📝 {def_text}\n"
+                        msg += f"   📝 {escape_markdown(def_text)}\n"
             else:
                 definition = data.get("definition", "No definition")
-                msg += f"   📝 {definition}\n"
+                msg += f"   📝 {escape_markdown(definition)}\n"
             
             related = data.get("related", [])
             if related:
-                msg += f"   🔗 Related: {', '.join(related)}\n"
+                related_escaped = ', '.join([escape_markdown(r) for r in related])
+                msg += f"   🔗 Related: {related_escaped}\n"
             
             msg += "\n"
         
         if len(msg) > 4000:
-            msg = msg[:4000] + "...\n\n⚠️ (Results truncated)"
+            msg = msg[:4000] + "\\.\\.\\.\n\n⚠️ \\(Results truncated\\)"
         
-        await update.message.reply_text(msg, reply_markup=get_main_menu())
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
         logger.error(f"Error in search_term: {e}")
@@ -408,11 +388,11 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error loading {kb_file}: {e}")
         
         if not all_terms:
-            await update.message.reply_text(
-                "📭 **Knowledge Base is Empty**\n\n"
-                "No terms found. Start adding terms or add me to a channel!",
-                reply_markup=get_main_menu()
+            msg = (
+                "📭 *Knowledge Base is Empty*\n\n"
+                "No terms found\\. Start adding terms or add me to a channel\\!"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         sorted_terms = sorted(all_terms.items())
@@ -422,19 +402,19 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chunks = [sorted_terms[i:i+chunk_size] for i in range(0, len(sorted_terms), chunk_size)]
             
             for chunk_idx, chunk in enumerate(chunks, 1):
-                chunk_msg = f"📚 **All Terms (Part {chunk_idx}/{len(chunks)})**\n\n"
+                chunk_msg = f"📚 *All Terms \\(Part {chunk_idx}/{len(chunks)}\\)*\n\n"
                 for i, (term, source) in enumerate(chunk, (chunk_idx-1)*chunk_size + 1):
-                    chunk_msg += f"{i}. {term} 📺 {source}\n"
+                    chunk_msg += f"{i}\\. {escape_markdown(term)} 📺 {escape_markdown(source)}\n"
                 
                 if chunk_idx == len(chunks):
-                    await update.message.reply_text(chunk_msg, reply_markup=get_main_menu())
+                    await update.message.reply_text(chunk_msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
                 else:
-                    await update.message.reply_text(chunk_msg)
+                    await update.message.reply_text(chunk_msg, parse_mode=ParseMode.MARKDOWN_V2)
         else:
-            msg = f"📚 **All Terms ({len(sorted_terms)} total)**\n\n"
+            msg = f"📚 *All Terms \\({len(sorted_terms)} total\\)*\n\n"
             for i, (term, source) in enumerate(sorted_terms, 1):
-                msg += f"{i}. {term} 📺 {source}\n"
-            await update.message.reply_text(msg, reply_markup=get_main_menu())
+                msg += f"{i}\\. {escape_markdown(term)} 📺 {escape_markdown(source)}\n"
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
         logger.error(f"Error in list_terms: {e}")
@@ -446,26 +426,26 @@ async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         channels = get_all_channels()
         
         if not channels:
-            await update.message.reply_text(
-                "📭 **No Active Channels**\n\n"
-                "Add me to a channel as an admin to start learning!\n\n"
-                "📌 **How to add me:**\n"
-                "1. Go to your channel settings\n"
-                "2. Add administrators\n"
-                "3. Search for this bot and add it\n"
-                "4. Post terms in format: `Term - Definition`",
-                reply_markup=get_main_menu()
+            msg = (
+                "📭 *No Active Channels*\n\n"
+                "Add me to a channel as an admin to start learning\\!\n\n"
+                "📌 *How to add me:*\n"
+                "1\\. Go to your channel settings\n"
+                "2\\. Add administrators\n"
+                "3\\. Search for this bot and add it\n"
+                "4\\. Post terms in format: `Term \\- Definition`"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
-        msg = f"📺 **Active Channels ({len(channels)})**\n\n"
+        msg = f"📺 *Active Channels \\({len(channels)}\\)*\n\n"
         
         for i, (channel_id, channel_name, term_count) in enumerate(channels, 1):
-            msg += f"**{i}. {channel_name}**\n"
+            msg += f"*{i}\\. {escape_markdown(channel_name)}*\n"
             msg += f"   📊 Terms: {term_count}\n"
             msg += f"   🆔 ID: `{channel_id}`\n\n"
         
-        await update.message.reply_text(msg, reply_markup=get_main_menu())
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
         logger.error(f"Error in show_channels: {e}")
@@ -483,7 +463,7 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        msg = "📊 **Detailed Channel Statistics**\n\n"
+        msg = "📊 *Detailed Channel Statistics*\n\n"
         
         total_terms = 0
         total_definitions = 0
@@ -499,16 +479,16 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_terms += term_count
             total_definitions += def_count
             
-            msg += f"**{i}. {channel_name}**\n"
+            msg += f"*{i}\\. {escape_markdown(channel_name)}*\n"
             msg += f"   📚 Terms: {term_count}\n"
             msg += f"   📝 Definitions: {def_count}\n"
             msg += f"   📈 Avg: {def_count/term_count:.1f} def/term\n\n"
         
-        msg += f"**📊 Overall Total:**\n"
+        msg += f"*📊 Overall Total:*\n"
         msg += f"   📚 Terms: {total_terms}\n"
         msg += f"   📝 Definitions: {total_definitions}\n"
         
-        await update.message.reply_text(msg, reply_markup=get_main_menu())
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
         logger.error(f"Error in channel_stats: {e}")
@@ -518,12 +498,12 @@ async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete a term from all knowledge bases"""
     try:
         if not context.args:
-            await update.message.reply_text(
-                "🗑️ **Delete a Term**\n\n"
-                "Please type the term you want to delete.\n\n"
-                "**Example:** `Algorithm`",
-                reply_markup=get_main_menu()
+            msg = (
+                "🗑️ *Delete a Term*\n\n"
+                "Please type the term you want to delete\\.\n\n"
+                "*Example:* `Algorithm`"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         term = " ".join(context.args)
@@ -554,14 +534,14 @@ async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"Error processing {kb_file}: {e}")
         
         if deleted_from:
-            msg = f"✅ **Term Deleted Successfully!**\n\n"
-            msg += f"🗑️ Deleted '**{term}**' from:\n"
-            msg += "\n".join(f"   • {source}" for source in deleted_from)
+            msg = f"✅ *Term Deleted Successfully\\!*\n\n"
+            msg += f"🗑️ Deleted '*{escape_markdown(term)}*' from:\n"
+            msg += "\n".join(f"   • {escape_markdown(source)}" for source in deleted_from)
             logger.info(f"Deleted term: {term} from {', '.join(deleted_from)}")
         else:
-            msg = f"❌ **Term Not Found**\n\nNo matches for: **{term}**"
+            msg = f"❌ *Term Not Found*\n\nNo matches for: *{escape_markdown(term)}*"
         
-        await update.message.reply_text(msg, reply_markup=get_main_menu())
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
         logger.error(f"Error in delete_term: {e}")
@@ -600,17 +580,17 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.error(f"Error processing {kb_file}: {e}")
         
-        msg = "📊 **Knowledge Base Statistics**\n\n"
-        msg += f"📺 Active Channels: **{total_channels}**\n"
-        msg += f"📚 Total Terms: **{total_terms}**\n"
-        msg += f"📝 Total Definitions: **{total_definitions}**\n"
+        msg = "📊 *Knowledge Base Statistics*\n\n"
+        msg += f"📺 Active Channels: *{total_channels}*\n"
+        msg += f"📚 Total Terms: *{total_terms}*\n"
+        msg += f"📝 Total Definitions: *{total_definitions}*\n"
         
         if total_terms > 0:
-            msg += f"📈 Avg Definitions/Term: **{total_definitions/total_terms:.1f}**\n"
+            msg += f"📈 Avg Definitions/Term: *{total_definitions/total_terms:.1f}*\n"
         
-        msg += f"\n💡 Keep learning! Add more channels or terms."
+        msg += f"\n💡 Keep learning\\! Add more channels or terms\\."
         
-        await update.message.reply_text(msg, reply_markup=get_main_menu())
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
         logger.error(f"Error in stats: {e}")
@@ -674,12 +654,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Handle menu button clicks
         if text == "🔍 Search":
-            await update.message.reply_text(
-                "🔍 **Search for a Term**\n\n"
-                "Please type the term you want to search for.\n\n"
-                "**Example:** `Algorithm`",
-                reply_markup=get_main_menu()
+            msg = (
+                "🔍 *Search for a Term*\n\n"
+                "Please type the term you want to search for\\.\n\n"
+                "*Example:* `Algorithm`"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         elif text == "📚 List All":
@@ -695,25 +675,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         elif text == "➕ Add Term":
-            await update.message.reply_text(
-                "📝 **Add a New Term**\n\n"
-                "**Format:** `/add Term - Definition`\n\n"
-                "**Example:**\n"
-                "`/add Algorithm - A step-by-step procedure for solving a problem`\n\n"
-                "Please send your term in the correct format:",
-                reply_markup=get_main_menu()
+            msg = (
+                "📝 *Add a New Term*\n\n"
+                "*Format:* `/add Term \\- Definition`\n\n"
+                "*Example:*\n"
+                "`/add Algorithm \\- A step\\-by\\-step procedure for solving a problem`\n\n"
+                "Please send your term in the correct format:"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         elif text == "🗑️ Delete Term":
-            await update.message.reply_text(
-                "🗑️ **Delete a Term**\n\n"
-                "**Format:** `/delete Term`\n\n"
-                "**Example:**\n"
+            msg = (
+                "🗑️ *Delete a Term*\n\n"
+                "*Format:* `/delete Term`\n\n"
+                "*Example:*\n"
                 "`/delete Algorithm`\n\n"
-                "Please send the term you want to delete:",
-                reply_markup=get_main_menu()
+                "Please send the term you want to delete:"
             )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
         elif text == "ℹ️ Help":
@@ -728,8 +708,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error handling message: {e}")
         await update.message.reply_text(
-            "❌ An error occurred. Please try again.",
-            reply_markup=get_main_menu()
+            "❌ An error occurred\\. Please try again\\.",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN_V2
         )
 
 # ====== MAIN ======
