@@ -46,36 +46,36 @@ def escape_markdown(text: str, preserve_code: bool = False) -> str:
             text = text.replace(char, f'\\{char}')
         return text
     
-    # Preserve code blocks and inline code
+    # Preserve code blocks and inline code by replacing them with placeholders
     code_blocks = []
     inline_codes = []
     
     # Extract code blocks (```code```)
     code_block_pattern = r'```[\s\S]*?```'
     for match in re.finditer(code_block_pattern, text):
-        placeholder = f"__CODE_BLOCK_{len(code_blocks)}__"
+        placeholder = f"__CODEBLOCK{len(code_blocks)}__"
         code_blocks.append(match.group())
         text = text.replace(match.group(), placeholder, 1)
     
     # Extract inline code (`code`)
-    inline_code_pattern = r'`[^`]+`'
+    inline_code_pattern = r'`[^`\n]+`'
     for match in re.finditer(inline_code_pattern, text):
-        placeholder = f"__INLINE_CODE_{len(inline_codes)}__"
+        placeholder = f"__INLINECODE{len(inline_codes)}__"
         inline_codes.append(match.group())
         text = text.replace(match.group(), placeholder, 1)
     
     # Escape special characters in remaining text
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     for char in special_chars:
         text = text.replace(char, f'\\{char}')
     
-    # Restore code blocks
+    # Restore code blocks (keep backticks unescaped)
     for i, code_block in enumerate(code_blocks):
-        text = text.replace(f"__CODE_BLOCK_{i}__", code_block)
+        text = text.replace(f"__CODEBLOCK{i}__", code_block)
     
-    # Restore inline codes
+    # Restore inline codes (keep backticks unescaped)
     for i, inline_code in enumerate(inline_codes):
-        text = text.replace(f"__INLINE_CODE_{i}__", inline_code)
+        text = text.replace(f"__INLINECODE{i}__", inline_code)
     
     return text
 
