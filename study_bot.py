@@ -32,11 +32,51 @@ logger = logging.getLogger(__name__)
 app = None
 
 # ====== HELPER FUNCTION FOR MARKDOWN ESCAPING ======
-def escape_markdown(text: str) -> str:
-    """Escape special characters for MarkdownV2"""
+def escape_markdown(text: str, preserve_code: bool = False) -> str:
+    """
+    Escape special characters for MarkdownV2
+    If preserve_code=True, preserves code blocks and inline code
+    """
+    if not text:
+        return text
+    
+    if not preserve_code:
+        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+        for char in special_chars:
+            text = text.replace(char, f'\\{char}')
+        return text
+    
+    # Preserve code blocks and inline code
+    code_blocks = []
+    inline_codes = []
+    
+    # Extract code blocks (```code```)
+    code_block_pattern = r'```[\s\S]*?```'
+    for match in re.finditer(code_block_pattern, text):
+        placeholder = f"__CODE_BLOCK_{len(code_blocks)}__"
+        code_blocks.append(match.group())
+        text = text.replace(match.group(), placeholder, 1)
+    
+    # Extract inline code (`code`)
+    inline_code_pattern = r'`[^`]+`'
+    for match in re.finditer(inline_code_pattern, text):
+        placeholder = f"__INLINE_CODE_{len(inline_codes)}__"
+        inline_codes.append(match.group())
+        text = text.replace(match.group(), placeholder, 1)
+    
+    # Escape special characters in remaining text
     special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     for char in special_chars:
         text = text.replace(char, f'\\{char}')
+    
+    # Restore code blocks
+    for i, code_block in enumerate(code_blocks):
+        text = text.replace(f"__CODE_BLOCK_{i}__", code_block)
+    
+    # Restore inline codes
+    for i, inline_code in enumerate(inline_codes):
+        text = text.replace(f"__INLINE_CODE_{i}__", inline_code)
+    
     return text
 
 # ====== DATA HELPERS ======
@@ -247,7 +287,7 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "added": str(update.message.date),
                 "related": []
             }
-            msg = f"✅ *Term Added Successfully\\!*\n\n📚 *{escape_markdown(term)}*\n📝 {escape_markdown(definition)}"
+            msg = f"✅ *Term Added Successfully\\!*\n\n📚 *{escape_markdown(term)}*\n📝 {escape_markdown(definition, preserve_code=True)}"
         
         save_knowledge(knowledge)
         await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
@@ -333,12 +373,12 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for j, def_item in enumerate(definitions, 1):
                     def_text = def_item.get("text", def_item) if isinstance(def_item, dict) else def_item
                     if len(definitions) > 1:
-                        msg += f"   {j}\\. {escape_markdown(def_text)}\n"
+                        msg += f"   {j}\\. {escape_markdown(def_text, preserve_code=True)}\n"
                     else:
-                        msg += f"   📝 {escape_markdown(def_text)}\n"
+                        msg += f"   📝 {escape_markdown(def_text, preserve_code=True)}\n"
             else:
                 definition = data.get("definition", "No definition")
-                msg += f"   📝 {escape_markdown(definition)}\n"
+                msg += f"   📝 {escape_markdown(definition, preserve_code=True)}\n"
             
             related = data.get("related", [])
             if related:
