@@ -57,37 +57,46 @@ def format_markdown_text(text: str, entities: list = None) -> str:
     if not entities:
         return safe_escape(text)
     
-    # Sort entities by offset (reverse order to process from end to start)
-    sorted_entities = sorted(entities, key=lambda e: e.offset, reverse=True)
+    # Build the result by processing entities in order
+    result_parts = []
+    last_pos = 0
     
-    result = text
+    # Sort entities by offset
+    sorted_entities = sorted(entities, key=lambda e: e.offset)
+    
     for entity in sorted_entities:
         start = entity.offset
         end = entity.offset + entity.length
+        
+        # Add unformatted text before this entity
+        if start > last_pos:
+            result_parts.append(safe_escape(text[last_pos:start]))
+        
         entity_text = text[start:end]
         
         # Apply formatting based on entity type
         if entity.type == "bold":
-            formatted = f"*{safe_escape(entity_text)}*"
+            result_parts.append(f"*{safe_escape(entity_text)}*")
         elif entity.type == "italic":
-            formatted = f"_{safe_escape(entity_text)}_"
+            result_parts.append(f"_{safe_escape(entity_text)}_")
         elif entity.type == "code":
-            formatted = f"`{entity_text}`"
+            result_parts.append(f"`{entity_text}`")
         elif entity.type == "pre":
-            formatted = f"```{entity_text}```"
+            result_parts.append(f"```{entity_text}```")
         elif entity.type == "underline":
-            formatted = f"__{safe_escape(entity_text)}__"
+            result_parts.append(f"__{safe_escape(entity_text)}__")
         elif entity.type == "strikethrough":
-            formatted = f"~{safe_escape(entity_text)}~"
+            result_parts.append(f"~{safe_escape(entity_text)}~")
         else:
-            formatted = safe_escape(entity_text)
+            result_parts.append(safe_escape(entity_text))
         
-        # Replace in result
-        result = result[:start] + formatted + result[end:]
+        last_pos = end
     
-    # Escape any remaining unformatted text
-    # This is complex, so we'll use a simpler approach: just return as-is if entities exist
-    return result
+    # Add remaining text
+    if last_pos < len(text):
+        result_parts.append(safe_escape(text[last_pos:]))
+    
+    return ''.join(result_parts)
 
 # ====== DATA HELPERS ======
 def get_knowledge_file(channel_id: int) -> str:
@@ -421,39 +430,68 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(unique_results) >= 5:
                     break
         
-        # Build response
+        # Build response with proper escaping
         msg = f"🔍 *Search Results for '{safe_escape(query)}'*\n\n"
         msg += f"Found {len(unique_results)} result{'s' if len(unique_results) != 1 else ''}:\n\n"
         
         for i, (term, data, score, channel_name, channel_id) in enumerate(unique_results, 1):
-            original = data.get("original_term", term)
-            
-            msg += f"*{i}\\. {safe_escape(original)}*"
-            if channel_name != "Manual":
-                msg += f" 📺 _{safe_escape(channel_name)}_"
-            msg += "\n"
-            
-            # Handle multiple definitions
-            if "definitions" in data and isinstance(data["definitions"], list):
-                definitions = data["definitions"]
-                for j, def_item in enumerate(definitions[:3], 1):  # Show max 3
-                    if isinstance(def_item, dict):
-                        def_text = def_item.get("text", "")
-                    else:
-                        def_text = str(def_item)
-                    
-                    if len(definitions) > 1:
-                        msg += f"   {j}\\. {def_text}\n"
-                    else:
-                        msg += f"   {def_text}\n"
+            try:
+                original = data.get("original_term", term)
                 
-                if len(definitions) > 3:
-                    msg += f"   _\\.\\.\\.and {len(definitions) - 3} more_\n"
-            else:
-                definition = data.get("definition", "No definition")
-                msg += f"   {definition}\n"
-            
-            msg += "\n"
+                msg += f"*{i}\\. {safe_escape(original)}*"
+                if channel_name != "Manual":
+                    msg += f" 📺 _{safe_escape(channel_name)}_"
+                msg += "\n"
+                
+                # Handle multiple definitions
+                if "definitions" in data and isinstance(data["definitions"], list):
+                    definitions = data["definitions"]
+                    for j, def_item in enumerate(definitions[:3], 1):  # Show max 3
+                        try:
+                            if isinstance(def_item, dict):
+                                def_text = def_item.get("text", "")
+                            else:
+                                def_text = str(def_item)
+                            
+                            # Ensure definition is properly escaped
+                            # Check if it's already in markdown format (contains unescaped markdown chars)
+                            if any(md in def_text for md in ['*', '_', '`', '[']):
+                                # Already formatted, use as-is
+                                safe_def = def_text
+                            else:
+                                # Plain text, escape it
+                                safe_def = safe_escape(def_text)
+                            
+                            if len(definitions) > 1:
+                                msg += f"   {j}\\. {safe_def}\n"
+                            else:
+                                msg += f"   {safe_def}\n"
+                        except Exception as e:
+                            logger.error(f"Error formatting definition {j}: {e}")
+                            msg += f"   _Definition error_\n"
+                    
+                    if len(definitions) > 3:
+                        msg += f"   _\\.\\.\\.and {len(definitions) - 3} more_\n"
+                else:
+                    # Single definition
+                    try:
+                        definition = data.get("definition", "No definition")
+                        
+                        # Check if already formatted
+                        if any(md in definition for md in ['*', '_', '`', '[']):
+                            safe_def = definition
+                        else:
+                            safe_def = safe_escape(definition)
+                        
+                        msg += f"   {safe_def}\n"
+                    except Exception as e:
+                        logger.error(f"Error formatting single definition: {e}")
+                        msg += f"   _Definition error_\n"
+                
+                msg += "\n"
+            except Exception as e:
+                logger.error(f"Error formatting result {i}: {e}")
+                msg += f"   _Error displaying this result_\n\n"
         
         await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
