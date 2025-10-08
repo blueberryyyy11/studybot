@@ -156,11 +156,15 @@ def search_knowledge(query: str, knowledge: Dict) -> List[tuple]:
     seen_terms = set()
     
     if query_norm in knowledge:
-        results.append((query_norm, knowledge[query_norm], 1.0))
-        seen_terms.add(query_norm)
+        data = knowledge[query_norm]
+        if isinstance(data, dict):  # FIX: Ensure data is a dictionary
+            results.append((query_norm, data, 1.0))
+            seen_terms.add(query_norm)
     
     for term, data in knowledge.items():
         if term in seen_terms:
+            continue
+        if not isinstance(data, dict):  # FIX: Skip corrupted entries
             continue
         if query_norm in term or term in query_norm:
             score = 0.8
@@ -171,8 +175,10 @@ def search_knowledge(query: str, knowledge: Dict) -> List[tuple]:
     close_matches = get_close_matches(query_norm, all_terms, n=3, cutoff=0.6)
     for match in close_matches:
         if match not in seen_terms:
-            results.append((match, knowledge[match], 0.6))
-            seen_terms.add(match)
+            data = knowledge[match]
+            if isinstance(data, dict):  # FIX: Ensure data is a dictionary
+                results.append((match, knowledge[match], 0.6))
+                seen_terms.add(match)
     
     results.sort(key=lambda x: x[2], reverse=True)
     return results[:5]
@@ -427,7 +433,6 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         sorted_terms = sorted(all_terms.items())
         
-        # FIX: Changed f-string to concatenation to avoid Python parser bug with backslash and parenthesis.
         msg = "📚 *All Terms* \\(" + str(len(sorted_terms)) + " total\\)\n\n"
         
         # Group by source for better organization
@@ -483,7 +488,6 @@ async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
-        # FIX: Changed f-string to concatenation to avoid Python parser bug with backslash and parenthesis.
         msg = "📺 *Active Channels* \\(" + str(len(channels)) + "\\)\n\n"
         
         for i, (channel_id, channel_name, term_count) in enumerate(channels, 1):
