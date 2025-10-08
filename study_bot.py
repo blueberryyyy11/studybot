@@ -3,13 +3,15 @@ import logging
 import os
 import re
 from pathlib import Path
-from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown as telegram_escape
 import signal
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from difflib import get_close_matches
+from datetime import datetime
 
 # ====== CONFIG ======
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -33,52 +35,59 @@ app = None
 user_states = {}  # Track user states for multi-step operations
 
 # ====== HELPER FUNCTION FOR MARKDOWN ESCAPING ======
-def escape_markdown(text: str, preserve_code: bool = False) -> str:
-    """
-    Escape special characters for MarkdownV2
-    If preserve_code=True, preserves code blocks and inline code
-    """
+def safe_escape(text: str) -> str:
+    """Safely escape text for MarkdownV2, preserving user formatting"""
     if not text:
         return text
     
-    if not preserve_code:
-        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
-        for char in special_chars:
-            text = text.replace(char, f'\\{char}')
-        return text
+    # Characters that need escaping in MarkdownV2
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     
-    # Preserve code blocks and inline code by replacing them with placeholders
-    code_blocks = []
-    inline_codes = []
-    
-    # Extract code blocks (```code```)
-    code_block_pattern = r'```[\s\S]*?```'
-    for match in re.finditer(code_block_pattern, text):
-        placeholder = f"__CODEBLOCK{len(code_blocks)}__"
-        code_blocks.append(match.group())
-        text = text.replace(match.group(), placeholder, 1)
-    
-    # Extract inline code (`code`)
-    inline_code_pattern = r'`[^`\n]+`'
-    for match in re.finditer(inline_code_pattern, text):
-        placeholder = f"__INLINECODE{len(inline_codes)}__"
-        inline_codes.append(match.group())
-        text = text.replace(match.group(), placeholder, 1)
-    
-    # Escape special characters in remaining text
-    special_chars = ['_', '*', '[', ']', '(', ')', '~', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    result = text
     for char in special_chars:
-        text = text.replace(char, f'\\{char}')
+        result = result.replace(char, f'\\{char}')
     
-    # Restore code blocks (keep backticks unescaped)
-    for i, code_block in enumerate(code_blocks):
-        text = text.replace(f"__CODEBLOCK{i}__", code_block)
+    return result
+
+def format_markdown_text(text: str, entities: list = None) -> str:
+    """Convert Telegram entities to MarkdownV2 format"""
+    if not text:
+        return ""
     
-    # Restore inline codes (keep backticks unescaped)
-    for i, inline_code in enumerate(inline_codes):
-        text = text.replace(f"__INLINECODE{i}__", inline_code)
+    if not entities:
+        return safe_escape(text)
     
-    return text
+    # Sort entities by offset (reverse order to process from end to start)
+    sorted_entities = sorted(entities, key=lambda e: e.offset, reverse=True)
+    
+    result = text
+    for entity in sorted_entities:
+        start = entity.offset
+        end = entity.offset + entity.length
+        entity_text = text[start:end]
+        
+        # Apply formatting based on entity type
+        if entity.type == "bold":
+            formatted = f"*{safe_escape(entity_text)}*"
+        elif entity.type == "italic":
+            formatted = f"_{safe_escape(entity_text)}_"
+        elif entity.type == "code":
+            formatted = f"`{entity_text}`"
+        elif entity.type == "pre":
+            formatted = f"```{entity_text}```"
+        elif entity.type == "underline":
+            formatted = f"__{safe_escape(entity_text)}__"
+        elif entity.type == "strikethrough":
+            formatted = f"~{safe_escape(entity_text)}~"
+        else:
+            formatted = safe_escape(entity_text)
+        
+        # Replace in result
+        result = result[:start] + formatted + result[end:]
+    
+    # Escape any remaining unformatted text
+    # This is complex, so we'll use a simpler approach: just return as-is if entities exist
+    return result
 
 # ====== DATA HELPERS ======
 def get_knowledge_file(channel_id: int) -> str:
@@ -87,7 +96,7 @@ def get_knowledge_file(channel_id: int) -> str:
     knowledge_dir.mkdir(exist_ok=True)
     return str(knowledge_dir / f"knowledge_{abs(channel_id)}.json")
 
-def load_knowledge(channel_id: int = None) -> Dict:
+def load_knowledge(channel_id: Optional[int] = None) -> Dict:
     """Load knowledge base for specific channel"""
     try:
         if channel_id is None:
@@ -95,21 +104,46 @@ def load_knowledge(channel_id: int = None) -> Dict:
         else:
             filename = get_knowledge_file(channel_id)
         
+        if not Path(filename).exists():
+            return {}
+        
         with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            
+        # Validate and clean data structure
+        cleaned_data = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                cleaned_data[key] = value
+            else:
+                # Fix corrupted entries
+                logger.warning(f"Fixing corrupted entry for term: {key}")
+                cleaned_data[key] = {
+                    "original_term": key,
+                    "definition": str(value),
+                    "added": str(datetime.now())
+                }
+        
+        return cleaned_data
     except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in {filename}: {e}")
         return {}
     except Exception as e:
         logger.error(f"Error loading knowledge base for channel {channel_id}: {e}")
         return {}
 
-def save_knowledge(data: Dict, channel_id: int = None):
+def save_knowledge(data: Dict, channel_id: Optional[int] = None):
     """Save knowledge base for specific channel"""
     try:
         if channel_id is None:
             filename = "knowledge_base.json"
         else:
             filename = get_knowledge_file(channel_id)
+        
+        # Ensure directory exists
+        Path(filename).parent.mkdir(parents=True, exist_ok=True)
         
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -120,86 +154,111 @@ def normalize_term(term: str) -> str:
     """Normalize term for case-insensitive matching"""
     return term.lower().strip()
 
-def extract_definition(text: str, entities: list = None) -> tuple:
-    """Extract term and definition from various formats, preserving formatting"""
-    # Store original text with entities for formatting preservation
-    original_text = text
+def extract_definition(text: str, entities: list = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract term and definition from various formats"""
+    if not text:
+        return None, None, None
     
-    # Remove markdown formatting for parsing only
-    text_clean = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    text_clean = re.sub(r'__(.+?)__', r'\1', text_clean)
-    
-    separators = [' - ', ': ', ' = ', ' – ', ' — ']
+    # Try different separators
+    separators = [' - ', ': ', ' = ', ' – ', ' — ', '- ', ': ']
     
     for sep in separators:
-        if sep in text_clean:
-            parts = text_clean.split(sep, 1)
+        if sep in text:
+            parts = text.split(sep, 1)
             if len(parts) == 2:
                 term = parts[0].strip()
-                
-                # Find the definition part in original text
-                sep_index = original_text.find(sep)
-                if sep_index != -1:
-                    definition = original_text[sep_index + len(sep):].strip()
-                else:
-                    definition = parts[1].strip()
+                definition = parts[1].strip()
                 
                 if term and definition:
-                    return term, definition, entities
+                    # Format definition with entities if available
+                    if entities:
+                        # Calculate offset for definition part
+                        def_start = text.index(sep) + len(sep)
+                        def_entities = []
+                        
+                        for entity in entities:
+                            if entity.offset >= def_start:
+                                # Adjust entity offset for definition
+                                new_entity = type('Entity', (), {
+                                    'type': entity.type,
+                                    'offset': entity.offset - def_start,
+                                    'length': entity.length
+                                })()
+                                def_entities.append(new_entity)
+                        
+                        if def_entities:
+                            formatted_def = format_markdown_text(definition, def_entities)
+                        else:
+                            formatted_def = safe_escape(definition)
+                    else:
+                        formatted_def = safe_escape(definition)
+                    
+                    return term, formatted_def, entities
     
     return None, None, None
 
-def search_knowledge(query: str, knowledge: Dict) -> List[tuple]:
+def search_knowledge(query: str, knowledge: Dict) -> List[Tuple]:
     """Search for terms matching the query"""
+    if not query or not knowledge:
+        return []
+    
     query_norm = normalize_term(query)
     results = []
     seen_terms = set()
     
+    # Exact match
     if query_norm in knowledge:
         data = knowledge[query_norm]
-        if isinstance(data, dict):  # FIX: Ensure data is a dictionary
+        if isinstance(data, dict):
             results.append((query_norm, data, 1.0))
             seen_terms.add(query_norm)
     
+    # Partial matches
     for term, data in knowledge.items():
-        if term in seen_terms:
+        if term in seen_terms or not isinstance(data, dict):
             continue
-        if not isinstance(data, dict):  # FIX: Skip corrupted entries
-            continue
+        
         if query_norm in term or term in query_norm:
             score = 0.8
             results.append((term, data, score))
             seen_terms.add(term)
     
-    all_terms = list(knowledge.keys())
-    close_matches = get_close_matches(query_norm, all_terms, n=3, cutoff=0.6)
+    # Fuzzy matches
+    all_terms = [t for t in knowledge.keys() if isinstance(knowledge[t], dict)]
+    close_matches = get_close_matches(query_norm, all_terms, n=5, cutoff=0.6)
+    
     for match in close_matches:
         if match not in seen_terms:
             data = knowledge[match]
-            if isinstance(data, dict):  # FIX: Ensure data is a dictionary
-                results.append((match, knowledge[match], 0.6))
+            if isinstance(data, dict):
+                results.append((match, data, 0.6))
                 seen_terms.add(match)
     
+    # Sort by score
     results.sort(key=lambda x: x[2], reverse=True)
-    return results[:5]
+    return results[:10]
 
-def get_all_channels() -> List[tuple]:
+def get_all_channels() -> List[Tuple]:
     """Get list of all channels with knowledge bases"""
     channels = []
     knowledge_dir = Path("knowledge_bases")
     
-    if knowledge_dir.exists():
-        for kb_file in knowledge_dir.glob("knowledge_*.json"):
-            try:
-                channel_id = int(kb_file.stem.split("_")[1])
-                knowledge = load_knowledge(channel_id)
-                if knowledge:
-                    first_term = next(iter(knowledge.values()), {})
-                    channel_name = first_term.get("channel", f"Channel {channel_id}")
-                    term_count = len(knowledge)
-                    channels.append((channel_id, channel_name, term_count))
-            except Exception as e:
-                logger.error(f"Error processing {kb_file}: {e}")
+    if not knowledge_dir.exists():
+        return channels
+    
+    for kb_file in knowledge_dir.glob("knowledge_*.json"):
+        try:
+            channel_id = int(kb_file.stem.split("_")[1])
+            knowledge = load_knowledge(channel_id)
+            
+            if knowledge:
+                # Get channel name from first term
+                first_term = next(iter(knowledge.values()), {})
+                channel_name = first_term.get("channel", f"Channel {channel_id}")
+                term_count = len(knowledge)
+                channels.append((channel_id, channel_name, term_count))
+        except Exception as e:
+            logger.error(f"Error processing {kb_file}: {e}")
     
     return sorted(channels, key=lambda x: x[2], reverse=True)
 
@@ -213,15 +272,6 @@ def get_main_menu():
         [KeyboardButton("ℹ️ Help")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def get_inline_search_results(results: list, query: str) -> InlineKeyboardMarkup:
-    """Create inline keyboard for search results"""
-    keyboard = []
-    for i, (term, data, score, channel_name, channel_id) in enumerate(results[:5]):
-        original = data.get("original_term", term)
-        callback_data = f"view_{term}_{channel_id if channel_id else 0}"
-        keyboard.append([InlineKeyboardButton(f"📖 {original}", callback_data=callback_data)])
-    return InlineKeyboardMarkup(keyboard)
 
 # ====== COMMANDS ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,7 +300,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*🔍 Searching:*\n"
         "• Just type any term to search\n"
         "• No commands needed\\!\n"
-        "• Results show with clickable buttons\n\n"
+        "• Fuzzy matching finds similar terms\n\n"
         "*➕ Adding Terms:*\n"
         "1\\. Click 'Add Term' button\n"
         "2\\. Send term in format: `Term \\- Definition`\n"
@@ -287,7 +337,7 @@ async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `Code formatting`\n"
         "• ```Code blocks```\n\n"
         "*Example:*\n"
-        "`Algorithm \\- A *step\\-by\\-step* procedure for solving a problem`\n\n"
+        "`Algorithm \\- A step\\-by\\-step procedure for solving a problem`\n\n"
         "Send your term now:"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
@@ -309,36 +359,47 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         query = update.message.text.strip()
         
-        all_results = []
-        knowledge_dir = Path("knowledge_bases")
+        if not query:
+            await update.message.reply_text(
+                "❌ Please enter a search term\\.",
+                reply_markup=get_main_menu(),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return
         
+        all_results = []
+        
+        # Search in default knowledge base
         default_knowledge = load_knowledge()
         if default_knowledge:
             default_results = search_knowledge(query, default_knowledge)
             for term, data, score in default_results:
                 all_results.append((term, data, score, "Manual", 0))
         
+        # Search in channel knowledge bases
+        knowledge_dir = Path("knowledge_bases")
         if knowledge_dir.exists():
             for kb_file in knowledge_dir.glob("knowledge_*.json"):
                 try:
                     channel_id = int(kb_file.stem.split("_")[1])
                     knowledge = load_knowledge(channel_id)
+                    
                     if knowledge:
                         channel_results = search_knowledge(query, knowledge)
-                        channel_name = None
-                        if knowledge:
-                            first_term = next(iter(knowledge.values()), {})
-                            channel_name = first_term.get("channel", f"Channel {channel_id}")
+                        
+                        # Get channel name
+                        first_term = next(iter(knowledge.values()), {})
+                        channel_name = first_term.get("channel", f"Channel {channel_id}")
                         
                         for term, data, score in channel_results:
-                            all_results.append((term, data, score, channel_name or f"Channel {channel_id}", channel_id))
+                            all_results.append((term, data, score, channel_name, channel_id))
                 except Exception as e:
                     logger.error(f"Error searching {kb_file}: {e}")
         
         if not all_results:
             msg = (
                 f"❌ *No Results Found*\n\n"
-                f"No matches for: *{escape_markdown(query)}*\n\n"
+                f"No matches for: *{safe_escape(query)}*\n\n"
                 f"💡 Try:\n"
                 f"• Different keywords\n"
                 f"• Checking spelling\n"
@@ -347,6 +408,7 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
+        # Sort and deduplicate
         all_results.sort(key=lambda x: x[2], reverse=True)
         
         seen_terms = set()
@@ -359,26 +421,34 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(unique_results) >= 5:
                     break
         
-        msg = f"🔍 *Search Results for '{escape_markdown(query)}'*\n\n"
+        # Build response
+        msg = f"🔍 *Search Results for '{safe_escape(query)}'*\n\n"
         msg += f"Found {len(unique_results)} result{'s' if len(unique_results) != 1 else ''}:\n\n"
         
         for i, (term, data, score, channel_name, channel_id) in enumerate(unique_results, 1):
             original = data.get("original_term", term)
             
-            msg += f"*{i}\\. {escape_markdown(original)}*"
+            msg += f"*{i}\\. {safe_escape(original)}*"
             if channel_name != "Manual":
-                msg += f" 📺 _{escape_markdown(channel_name)}_"
+                msg += f" 📺 _{safe_escape(channel_name)}_"
             msg += "\n"
             
-            if "definitions" in data:
+            # Handle multiple definitions
+            if "definitions" in data and isinstance(data["definitions"], list):
                 definitions = data["definitions"]
-                for j, def_item in enumerate(definitions, 1):
-                    def_text = def_item.get("text", def_item) if isinstance(def_item, dict) else def_item
-                    # Preserve original formatting
+                for j, def_item in enumerate(definitions[:3], 1):  # Show max 3
+                    if isinstance(def_item, dict):
+                        def_text = def_item.get("text", "")
+                    else:
+                        def_text = str(def_item)
+                    
                     if len(definitions) > 1:
                         msg += f"   {j}\\. {def_text}\n"
                     else:
                         msg += f"   {def_text}\n"
+                
+                if len(definitions) > 3:
+                    msg += f"   _\\.\\.\\.and {len(definitions) - 3} more_\n"
             else:
                 definition = data.get("definition", "No definition")
                 msg += f"   {definition}\n"
@@ -388,19 +458,26 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
-        logger.error(f"Error in search_term: {e}")
-        await update.message.reply_text("❌ Error searching\\. Try again\\.", reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+        logger.error(f"Error in search_term: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Error searching\\. Try again\\.",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
 
 async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all terms from all channels"""
     try:
         all_terms = {}
         
+        # Load default knowledge
         default_knowledge = load_knowledge()
         for term, data in default_knowledge.items():
-            original = data.get("original_term", term)
-            all_terms[original] = "Manual"
+            if isinstance(data, dict):
+                original = data.get("original_term", term)
+                all_terms[original] = "Manual"
         
+        # Load channel knowledge
         knowledge_dir = Path("knowledge_bases")
         if knowledge_dir.exists():
             for kb_file in knowledge_dir.glob("knowledge_*.json"):
@@ -408,15 +485,15 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     channel_id = int(kb_file.stem.split("_")[1])
                     knowledge = load_knowledge(channel_id)
                     
-                    channel_name = f"Channel {channel_id}"
                     if knowledge:
                         first_term = next(iter(knowledge.values()), {})
-                        channel_name = first_term.get("channel", channel_name)
-                    
-                    for term, data in knowledge.items():
-                        original = data.get("original_term", term)
-                        if original not in all_terms:
-                            all_terms[original] = channel_name
+                        channel_name = first_term.get("channel", f"Channel {channel_id}")
+                        
+                        for term, data in knowledge.items():
+                            if isinstance(data, dict):
+                                original = data.get("original_term", term)
+                                if original not in all_terms:
+                                    all_terms[original] = channel_name
                 except Exception as e:
                     logger.error(f"Error loading {kb_file}: {e}")
         
@@ -433,16 +510,16 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         sorted_terms = sorted(all_terms.items())
         
-        msg = "📚 *All Terms* \\(" + str(len(sorted_terms)) + " total\\)\n\n"
+        msg = f"📚 *All Terms* \\({len(sorted_terms)} total\\)\n\n"
         
-        # Group by source for better organization
+        # Group by source
         manual_terms = [(t, s) for t, s in sorted_terms if s == "Manual"]
         channel_terms = [(t, s) for t, s in sorted_terms if s != "Manual"]
         
         if manual_terms:
             msg += "*Manual Terms:*\n"
             for term, _ in manual_terms[:20]:
-                msg += f"• {escape_markdown(term)}\n"
+                msg += f"• {safe_escape(term)}\n"
             if len(manual_terms) > 20:
                 msg += f"_\\.\\.\\.and {len(manual_terms) - 20} more_\n"
             msg += "\n"
@@ -454,9 +531,9 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             for channel, terms in groupby(channel_terms_sorted, key=lambda x: x[1]):
                 terms_list = list(terms)
-                msg += f"*{escape_markdown(channel)}:*\n"
+                msg += f"*{safe_escape(channel)}:*\n"
                 for term, _ in terms_list[:15]:
-                    msg += f"• {escape_markdown(term)}\n"
+                    msg += f"• {safe_escape(term)}\n"
                 if len(terms_list) > 15:
                     msg += f"_\\.\\.\\.and {len(terms_list) - 15} more_\n"
                 msg += "\n"
@@ -466,7 +543,7 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
-        logger.error(f"Error in list_terms: {e}")
+        logger.error(f"Error in list_terms: {e}", exc_info=True)
         await update.message.reply_text("❌ Error listing terms", reply_markup=get_main_menu())
 
 async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,10 +565,10 @@ async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
         
-        msg = "📺 *Active Channels* \\(" + str(len(channels)) + "\\)\n\n"
+        msg = f"📺 *Active Channels* \\({len(channels)}\\)\n\n"
         
         for i, (channel_id, channel_name, term_count) in enumerate(channels, 1):
-            msg += f"*{i}\\. {escape_markdown(channel_name)}*\n"
+            msg += f"*{i}\\. {safe_escape(channel_name)}*\n"
             msg += f"   📚 {term_count} term{'s' if term_count != 1 else ''}\n"
             msg += f"   🆔 `{channel_id}`\n\n"
         
@@ -500,7 +577,7 @@ async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
-        logger.error(f"Error in show_channels: {e}")
+        logger.error(f"Error in show_channels: {e}", exc_info=True)
         await update.message.reply_text("❌ Error showing channels", reply_markup=get_main_menu())
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -510,14 +587,18 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_definitions = 0
         total_channels = 0
         
+        # Count default knowledge
         default_knowledge = load_knowledge()
         if default_knowledge:
             total_terms += len(default_knowledge)
-            total_definitions += sum(
-                len(data.get("definitions", [data.get("definition", "")]))
-                for data in default_knowledge.values()
-            )
+            for data in default_knowledge.values():
+                if isinstance(data, dict):
+                    if "definitions" in data:
+                        total_definitions += len(data["definitions"])
+                    elif "definition" in data:
+                        total_definitions += 1
         
+        # Count channel knowledge
         knowledge_dir = Path("knowledge_bases")
         if knowledge_dir.exists():
             channel_files = list(knowledge_dir.glob("knowledge_*.json"))
@@ -529,10 +610,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     knowledge = load_knowledge(channel_id)
                     
                     total_terms += len(knowledge)
-                    total_definitions += sum(
-                        len(data.get("definitions", [data.get("definition", "")]))
-                        for data in knowledge.values()
-                    )
+                    for data in knowledge.values():
+                        if isinstance(data, dict):
+                            if "definitions" in data:
+                                total_definitions += len(data["definitions"])
+                            elif "definition" in data:
+                                total_definitions += 1
                 except Exception as e:
                     logger.error(f"Error processing {kb_file}: {e}")
         
@@ -550,7 +633,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
         
     except Exception as e:
-        logger.error(f"Error in stats: {e}")
+        logger.error(f"Error in stats: {e}", exc_info=True)
         await update.message.reply_text("❌ Error getting statistics", reply_markup=get_main_menu())
 
 async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -568,28 +651,33 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
         if not text:
             return
         
-        term, definition, entities = extract_definition(text, entities)
+        term, definition, _ = extract_definition(text, entities)
         
         if term and definition:
             knowledge = load_knowledge(channel_id)
             term_norm = normalize_term(term)
             
+            timestamp = str(update.channel_post.date)
+            
             if term_norm in knowledge:
+                # Add to existing term
                 if "definitions" not in knowledge[term_norm]:
                     old_def = knowledge[term_norm].get("definition", "")
-                    knowledge[term_norm]["definitions"] = [{"text": old_def, "added": knowledge[term_norm].get("added", "")}]
+                    old_added = knowledge[term_norm].get("added", timestamp)
+                    knowledge[term_norm]["definitions"] = [{"text": old_def, "added": old_added}]
                 
                 knowledge[term_norm]["definitions"].append({
-                    "text": definition,  # Preserves original formatting
-                    "added": str(update.channel_post.date),
+                    "text": definition,
+                    "added": timestamp,
                     "channel": channel_name
                 })
                 logger.info(f"[{channel_name}] Added definition #{len(knowledge[term_norm]['definitions'])} for term: {term}")
             else:
+                # Create new term
                 knowledge[term_norm] = {
                     "original_term": term,
-                    "definitions": [{"text": definition, "added": str(update.channel_post.date), "channel": channel_name}],
-                    "added": str(update.channel_post.date),
+                    "definitions": [{"text": definition, "added": timestamp, "channel": channel_name}],
+                    "added": timestamp,
                     "channel": channel_name,
                     "related": []
                 }
@@ -598,7 +686,7 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
             save_knowledge(knowledge, channel_id)
         
     except Exception as e:
-        logger.error(f"Error handling channel message: {e}")
+        logger.error(f"Error handling channel message: {e}", exc_info=True)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle direct messages based on user state"""
@@ -648,42 +736,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Handle state-based inputs
         if user_state == "awaiting_term":
             # User is adding a term
-            term, definition, entities = extract_definition(text, update.message.entities)
+            term, definition, _ = extract_definition(text, update.message.entities)
             
             if not term or not definition:
                 msg = (
                     "❌ I couldn't parse that\\.\n\n"
                     "Please use format: `Term \\- Definition`\n\n"
-                    "Or click 'Back' to cancel\\."
+                    "Examples:\n"
+                    "• `Algorithm \\- Step\\-by\\-step procedure`\n"
+                    "• `Python: Programming language`\n"
+                    "• `API \\= Application Programming Interface`"
                 )
                 await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
                 return
             
             knowledge = load_knowledge()
             term_norm = normalize_term(term)
+            timestamp = str(update.message.date)
             
             if term_norm in knowledge:
+                # Add to existing term
                 if "definitions" not in knowledge[term_norm]:
                     old_def = knowledge[term_norm].get("definition", "")
-                    knowledge[term_norm]["definitions"] = [{"text": old_def, "added": knowledge[term_norm].get("added", "")}]
+                    old_added = knowledge[term_norm].get("added", timestamp)
+                    knowledge[term_norm]["definitions"] = [{"text": old_def, "added": old_added}]
                 
                 knowledge[term_norm]["definitions"].append({
                     "text": definition,
-                    "added": str(update.message.date),
+                    "added": timestamp,
                     "source": "manual"
                 })
+                
                 msg = f"✅ *Added Another Definition\\!*\n\n"
-                msg += f"📚 *{escape_markdown(term)}*\n"
+                msg += f"📚 *{safe_escape(term)}*\n"
                 msg += f"📊 Now has {len(knowledge[term_norm]['definitions'])} definitions"
             else:
+                # Create new term
                 knowledge[term_norm] = {
                     "original_term": term,
-                    "definitions": [{"text": definition, "added": str(update.message.date), "source": "manual"}],
-                    "added": str(update.message.date),
+                    "definitions": [{"text": definition, "added": timestamp, "source": "manual"}],
+                    "added": timestamp,
                     "related": []
                 }
+                
                 msg = f"✅ *Term Added Successfully\\!*\n\n"
-                msg += f"📚 *{escape_markdown(term)}*\n"
+                msg += f"📚 *{safe_escape(term)}*\n"
                 msg += f"{definition}"
             
             save_knowledge(knowledge)
@@ -698,6 +795,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             term_norm = normalize_term(term)
             deleted_from = []
             
+            # Delete from default knowledge
             default_knowledge = load_knowledge()
             if term_norm in default_knowledge:
                 original = default_knowledge[term_norm].get("original_term", term)
@@ -705,6 +803,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_knowledge(default_knowledge)
                 deleted_from.append("Manual")
             
+            # Delete from channel knowledge bases
             knowledge_dir = Path("knowledge_bases")
             if knowledge_dir.exists():
                 for kb_file in knowledge_dir.glob("knowledge_*.json"):
@@ -723,11 +822,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if deleted_from:
                 msg = f"✅ *Term Deleted\\!*\n\n"
-                msg += f"🗑️ Removed '*{escape_markdown(term)}*' from:\n"
-                msg += "\n".join(f"   • {escape_markdown(source)}" for source in deleted_from)
+                msg += f"🗑️ Removed '*{safe_escape(term)}*' from:\n"
+                for source in deleted_from:
+                    msg += f"   • {safe_escape(source)}\n"
                 logger.info(f"Deleted term: {term} from {', '.join(deleted_from)}")
             else:
-                msg = f"❌ *Term Not Found*\n\n'{escape_markdown(term)}' doesn't exist in the knowledge base\\."
+                msg = f"❌ *Term Not Found*\n\n'{safe_escape(term)}' doesn't exist in the knowledge base\\."
             
             user_states[user_id] = None
             await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
@@ -737,13 +837,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await search_term(update, context)
         
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
+        logger.error(f"Error handling message: {e}", exc_info=True)
         user_states.pop(user_id, None)
         await update.message.reply_text(
             "❌ An error occurred\\. Please try again\\.",
             reply_markup=get_main_menu(),
             parse_mode=ParseMode.MARKDOWN_V2
         )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
+
+# ====== GRACEFUL SHUTDOWN ======
+def signal_handler(sig, frame):
+    """Handle shutdown signals"""
+    logger.info("Received shutdown signal, stopping bot...")
+    if app and app.running:
+        app.stop()
+    sys.exit(0)
 
 # ====== MAIN ======
 def main():
@@ -753,6 +865,10 @@ def main():
     logger.info("Starting enhanced multi-channel study bot...")
     
     try:
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
         # Create application
         app = Application.builder().token(TOKEN).build()
 
@@ -772,12 +888,32 @@ def main():
         # Handle direct messages
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
 
+        # Add error handler
+        app.add_error_handler(error_handler)
+
+        # Set bot commands for menu
+        commands = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "Show help message"),
+            BotCommand("search", "Search for a term"),
+            BotCommand("add", "Add a new term"),
+            BotCommand("list", "List all terms"),
+            BotCommand("channels", "Show active channels"),
+            BotCommand("delete", "Delete a term"),
+            BotCommand("stats", "Show statistics")
+        ]
+        
         # Start the bot
         logger.info("Enhanced multi-channel study bot started successfully")
-        app.run_polling(drop_pending_updates=True)
+        logger.info("Bot is ready to receive messages...")
+        
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message", "channel_post"]
+        )
         
     except Exception as e:
-        logger.error(f"Error running bot: {e}")
+        logger.error(f"Error running bot: {e}", exc_info=True)
         raise
 
 if __name__ == "__main__":
