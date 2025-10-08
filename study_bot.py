@@ -1,644 +1,920 @@
-#!/usr/bin/env python3
-"""
-Flashcard Multi-Channel Bot
-- Per-channel and global knowledge bases (JSON)
-- Safe MarkdownV2 escaping (preserves code blocks / inline code)
-- Add / delete / list / search / stats / channels
-- Auto-ingest channel posts with "Term - Definition" (or :, =)
-- Robust file I/O with atomic replace and simple repairs for corrupted JSON
-"""
-
-from __future__ import annotations
 import json
 import logging
 import os
 import re
-import sys
-import tempfile
-from datetime import datetime
-from difflib import get_close_matches
 from pathlib import Path
-from threading import Lock
+from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown as telegram_escape
+import signal
+import sys
 from typing import Dict, List, Optional, Tuple
-
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.constants import ParseMode, ChatType
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from difflib import get_close_matches
+from datetime import datetime
 
 # ====== CONFIG ======
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    print("Error: TELEGRAM_BOT_TOKEN environment variable not set.")
-    sys.exit(1)
-
-DATA_DIR = Path("knowledge_data")
-GLOBAL_FILE = DATA_DIR / "global.json"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+    raise ValueError("Please set TELEGRAM_BOT_TOKEN environment variable in Railway dashboard")
 
 # ====== LOGGING ======
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("study_bot.log", encoding="utf-8")
+    ]
 )
+
 logger = logging.getLogger(__name__)
 
-# ====== GLOBAL STATE ======
-_user_states: Dict[int, Optional[str]] = {}  # user_id -> None | "awaiting_term" | "awaiting_delete"
-_file_lock = Lock()  # simple process-level lock for file I/O
+# ====== GLOBAL VARIABLES ======
+app = None
+user_states = {}  # Track user states for multi-step operations
 
-# ====== UTILITIES ======
-MDV2_SPECIAL = r"_*[]()~`>#+-=|{}.!\\"
+# ====== HELPER FUNCTION FOR MARKDOWN ESCAPING ======
+def safe_escape(text: str) -> str:
+    """Safely escape text for MarkdownV2, preserving user formatting"""
+    if not text:
+        return text
+    
+    # Characters that need escaping in MarkdownV2
+    special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+    
+    result = text
+    for char in special_chars:
+        result = result.replace(char, f'\\{char}')
+    
+    return result
 
-def escape_markdown_v2(text: str, preserve_code: bool = True) -> str:
-    """
-    Escape text for Telegram MarkdownV2.
-    If preserve_code is True, code blocks (```...```) and inline code (`...`) remain unescaped inside backticks.
-    """
-    if text is None:
+def format_markdown_text(text: str, entities: list = None) -> str:
+    """Convert Telegram entities to MarkdownV2 format"""
+    if not text:
         return ""
-    # Quick path for empty
-    if text == "":
-        return ""
-
-    if not preserve_code:
-        # Escape everything
-        return "".join("\\" + ch if ch in MDV2_SPECIAL else ch for ch in text)
-
-    # We will replace code blocks and inline code with placeholders, escape the rest, then restore
-    code_block_pattern = re.compile(r"```[\s\S]*?```")
-    inline_code_pattern = re.compile(r"`[^`\n]+`")
-
-    code_blocks = []
-    def repl_block(m):
-        code_blocks.append(m.group(0))
-        return f"__CODEBLOCK_{len(code_blocks)-1}__"
-
-    text_tmp = code_block_pattern.sub(repl_block, text)
-
-    inline_codes = []
-    def repl_inline(m):
-        inline_codes.append(m.group(0))
-        return f"__INLINE_{len(inline_codes)-1}__"
-
-    text_tmp = inline_code_pattern.sub(repl_inline, text_tmp)
-
-    # Escape remaining
-    escaped = []
-    for ch in text_tmp:
-        if ch in MDV2_SPECIAL:
-            escaped.append("\\" + ch)
+    
+    if not entities:
+        return safe_escape(text)
+    
+    # Sort entities by offset (reverse order to process from end to start)
+    sorted_entities = sorted(entities, key=lambda e: e.offset, reverse=True)
+    
+    result = text
+    for entity in sorted_entities:
+        start = entity.offset
+        end = entity.offset + entity.length
+        entity_text = text[start:end]
+        
+        # Apply formatting based on entity type
+        if entity.type == "bold":
+            formatted = f"*{safe_escape(entity_text)}*"
+        elif entity.type == "italic":
+            formatted = f"_{safe_escape(entity_text)}_"
+        elif entity.type == "code":
+            formatted = f"`{entity_text}`"
+        elif entity.type == "pre":
+            formatted = f"```{entity_text}```"
+        elif entity.type == "underline":
+            formatted = f"__{safe_escape(entity_text)}__"
+        elif entity.type == "strikethrough":
+            formatted = f"~{safe_escape(entity_text)}~"
         else:
-            escaped.append(ch)
-    escaped_text = "".join(escaped)
+            formatted = safe_escape(entity_text)
+        
+        # Replace in result
+        result = result[:start] + formatted + result[end:]
+    
+    # Escape any remaining unformatted text
+    # This is complex, so we'll use a simpler approach: just return as-is if entities exist
+    return result
 
-    # restore inline codes (keep backticks, do NOT escape inside)
-    for i, code in enumerate(inline_codes):
-        escaped_text = escaped_text.replace(f"__INLINE_{i}__", code)
+# ====== DATA HELPERS ======
+def get_knowledge_file(channel_id: int) -> str:
+    """Get knowledge base file for specific channel"""
+    knowledge_dir = Path("knowledge_bases")
+    knowledge_dir.mkdir(exist_ok=True)
+    return str(knowledge_dir / f"knowledge_{abs(channel_id)}.json")
 
-    # restore code blocks
-    for i, block in enumerate(code_blocks):
-        escaped_text = escaped_text.replace(f"__CODEBLOCK_{i}__", block)
-
-    return escaped_text
-
-def atomic_write_json(path: Path, data: dict) -> None:
-    """Write JSON atomically using a temp file and os.replace."""
-    with _file_lock:
-        tmp_fd, tmp_path = tempfile.mkstemp(prefix="tmp_kb_", dir=str(path.parent))
-        os.close(tmp_fd)
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_path, str(path))
-        except Exception:
-            logger.exception(f"Failed atomic write to {path}")
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-def load_json_file(path: Path) -> Dict:
-    """Load JSON safely; repair simple corruption (non-dict root or non-dict entries)."""
-    if not path.exists():
-        return {}
+def load_knowledge(channel_id: Optional[int] = None) -> Dict:
+    """Load knowledge base for specific channel"""
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            logger.warning(f"{path} root is not a dict, resetting to empty dict.")
+        if channel_id is None:
+            filename = "knowledge_base.json"
+        else:
+            filename = get_knowledge_file(channel_id)
+        
+        if not Path(filename).exists():
             return {}
-        # repair entries that are not dicts
-        repaired = False
-        for k, v in list(data.items()):
-            if not isinstance(v, dict):
-                data[k] = {"definition": str(v)}
-                repaired = True
-        if repaired:
-            # try to persist repair
-            try:
-                atomic_write_json(path, data)
-            except Exception:
-                logger.exception("Failed to persist repair")
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error in {path}: {e}. Renaming corrupted file and returning empty dict.")
-        # move corrupted file aside
-        try:
-            corrupt_name = path.with_suffix(path.suffix + ".corrupt")
-            os.replace(str(path), str(corrupt_name))
-            logger.info(f"Moved corrupted file to {corrupt_name}")
-        except Exception:
-            logger.exception("Failed to move corrupted file")
+        
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        # Validate and clean data structure
+        cleaned_data = {}
+        for key, value in data.items():
+            if isinstance(value, dict):
+                cleaned_data[key] = value
+            else:
+                # Fix corrupted entries
+                logger.warning(f"Fixing corrupted entry for term: {key}")
+                cleaned_data[key] = {
+                    "original_term": key,
+                    "definition": str(value),
+                    "added": str(datetime.now())
+                }
+        
+        return cleaned_data
+    except FileNotFoundError:
         return {}
-    except Exception:
-        logger.exception(f"Unexpected error loading {path}")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error in {filename}: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading knowledge base for channel {channel_id}: {e}")
         return {}
 
-def get_channel_file(channel_id: Optional[int]) -> Path:
-    """Return Path for a channel-specific knowledge file, or global file if channel_id is None"""
-    if channel_id is None or channel_id == 0:
-        return GLOBAL_FILE
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    return DATA_DIR / f"knowledge_{abs(channel_id)}.json"
+def save_knowledge(data: Dict, channel_id: Optional[int] = None):
+    """Save knowledge base for specific channel"""
+    try:
+        if channel_id is None:
+            filename = "knowledge_base.json"
+        else:
+            filename = get_knowledge_file(channel_id)
+        
+        # Ensure directory exists
+        Path(filename).parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Error saving knowledge base for channel {channel_id}: {e}")
 
 def normalize_term(term: str) -> str:
+    """Normalize term for case-insensitive matching"""
     return term.lower().strip()
 
-def parse_term_definition(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Parse common separators for term and definition.
-    Supports: " - ", " : ", " = ", single "-" ":" "=" as fallback.
-    Returns (term, definition) or (None, None) if parsing failed (empty or no separator).
-    """
-    if not text or not text.strip():
-        return None, None
-    # Prefer separators with spaces to avoid splitting hyphenated words, but fall back
-    separators = [" - ", " : ", " = ", " – ", " — ", ":", "-", "="]
+def extract_definition(text: str, entities: list = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract term and definition from various formats"""
+    if not text:
+        return None, None, None
+    
+    # Try different separators
+    separators = [' - ', ': ', ' = ', ' – ', ' — ', '- ', ': ']
+    
     for sep in separators:
         if sep in text:
-            left, right = text.split(sep, 1)
-            left, right = left.strip(), right.strip()
-            if left and right:
-                return left, right
-    return None, None
+            parts = text.split(sep, 1)
+            if len(parts) == 2:
+                term = parts[0].strip()
+                definition = parts[1].strip()
+                
+                if term and definition:
+                    # Format definition with entities if available
+                    if entities:
+                        # Calculate offset for definition part
+                        def_start = text.index(sep) + len(sep)
+                        def_entities = []
+                        
+                        for entity in entities:
+                            if entity.offset >= def_start:
+                                # Adjust entity offset for definition
+                                new_entity = type('Entity', (), {
+                                    'type': entity.type,
+                                    'offset': entity.offset - def_start,
+                                    'length': entity.length
+                                })()
+                                def_entities.append(new_entity)
+                        
+                        if def_entities:
+                            formatted_def = format_markdown_text(definition, def_entities)
+                        else:
+                            formatted_def = safe_escape(definition)
+                    else:
+                        formatted_def = safe_escape(definition)
+                    
+                    return term, formatted_def, entities
+    
+    return None, None, None
 
-# ====== KNOWLEDGE HELPERS ======
-def load_knowledge(channel_id: Optional[int] = None) -> Dict:
-    path = get_channel_file(channel_id)
-    return load_json_file(path)
-
-def save_knowledge(data: Dict, channel_id: Optional[int] = None) -> None:
-    path = get_channel_file(channel_id)
-    atomic_write_json(path, data)
-
-def get_all_channel_files() -> List[Tuple[int, Path]]:
-    """Return list of (channel_id, path) for each channel knowledge file present."""
-    files = []
-    for f in DATA_DIR.glob("knowledge_*.json"):
-        try:
-            # filename pattern knowledge_<id>.json
-            m = re.match(r"knowledge_(-?\d+)\.json", f.name)
-            if m:
-                cid = int(m.group(1))
-                files.append((cid, f))
-        except Exception:
-            continue
-    return files
-
-# ====== SEARCH ======
-def search_in_knowledge(query: str, kb: Dict) -> List[Tuple[str, Dict, float]]:
-    """
-    Search in a single KB dict (normalized keys -> data dict).
-    Returns list of tuples (term_norm, data, score)
-    """
-    if not query:
+def search_knowledge(query: str, knowledge: Dict) -> List[Tuple]:
+    """Search for terms matching the query"""
+    if not query or not knowledge:
         return []
-    q = normalize_term(query)
+    
+    query_norm = normalize_term(query)
     results = []
-    seen = set()
-
-    # exact match
-    if q in kb:
-        results.append((q, kb[q], 1.0))
-        seen.add(q)
-
-    # substring matches in keys or definition
-    for term_norm, data in kb.items():
-        if term_norm in seen:
+    seen_terms = set()
+    
+    # Exact match
+    if query_norm in knowledge:
+        data = knowledge[query_norm]
+        if isinstance(data, dict):
+            results.append((query_norm, data, 1.0))
+            seen_terms.add(query_norm)
+    
+    # Partial matches
+    for term, data in knowledge.items():
+        if term in seen_terms or not isinstance(data, dict):
             continue
-        # ensure data is dict
-        if not isinstance(data, dict):
-            continue
-        definition = normalize_term(data.get("definition", "") or "")
-        if q in term_norm or q in definition:
-            results.append((term_norm, data, 0.8))
-            seen.add(term_norm)
-
-    # fuzzy on term names
-    names = list(kb.keys())
-    close = get_close_matches(q, names, n=5, cutoff=0.6)
-    for c in close:
-        if c not in seen:
-            results.append((c, kb[c], 0.6))
-            seen.add(c)
-
+        
+        if query_norm in term or term in query_norm:
+            score = 0.8
+            results.append((term, data, score))
+            seen_terms.add(term)
+    
+    # Fuzzy matches
+    all_terms = [t for t in knowledge.keys() if isinstance(knowledge[t], dict)]
+    close_matches = get_close_matches(query_norm, all_terms, n=5, cutoff=0.6)
+    
+    for match in close_matches:
+        if match not in seen_terms:
+            data = knowledge[match]
+            if isinstance(data, dict):
+                results.append((match, data, 0.6))
+                seen_terms.add(match)
+    
+    # Sort by score
     results.sort(key=lambda x: x[2], reverse=True)
-    return results
+    return results[:10]
 
-def search_all(query: str, include_global: bool = True, channel_scan: bool = True, max_results: int = 10) -> List[Tuple[str, Dict, float, Optional[int]]]:
-    """
-    Search across global KB and all channel KBs.
-    Returns list of (term_norm, data, score, channel_id) where channel_id=None for global.
-    Deduplicates terms preferring higher score.
-    """
-    combined = []
-    # global
-    if include_global:
-        kb = load_knowledge(None)
-        for t, d, s in search_in_knowledge(query, kb):
-            combined.append((t, d, s, None))
-    # channels
-    if channel_scan:
-        for cid, _path in get_all_channel_files():
-            kb = load_knowledge(cid)
-            for t, d, s in search_in_knowledge(query, kb):
-                combined.append((t, d, s, cid))
+def get_all_channels() -> List[Tuple]:
+    """Get list of all channels with knowledge bases"""
+    channels = []
+    knowledge_dir = Path("knowledge_bases")
+    
+    if not knowledge_dir.exists():
+        return channels
+    
+    for kb_file in knowledge_dir.glob("knowledge_*.json"):
+        try:
+            channel_id = int(kb_file.stem.split("_")[1])
+            knowledge = load_knowledge(channel_id)
+            
+            if knowledge:
+                # Get channel name from first term
+                first_term = next(iter(knowledge.values()), {})
+                channel_name = first_term.get("channel", f"Channel {channel_id}")
+                term_count = len(knowledge)
+                channels.append((channel_id, channel_name, term_count))
+        except Exception as e:
+            logger.error(f"Error processing {kb_file}: {e}")
+    
+    return sorted(channels, key=lambda x: x[2], reverse=True)
 
-    # deduplicate by term_norm keeping highest score; if same score prefer channel-specific (cid not None)
-    best = {}
-    for term, data, score, cid in combined:
-        key = term
-        old = best.get(key)
-        if not old or score > old[0] or (score == old[0] and (cid is not None and old[1] is None)):
-            best[key] = (score, cid, data)
-
-    results = []
-    for term, (score, cid, data) in best.items():
-        results.append((term, data, score, cid))
-
-    results.sort(key=lambda x: x[2], reverse=True)
-    return results[:max_results]
-
-# ====== BOT HELPERS (menus, messages) ======
-def main_menu_markup():
+# ====== MENU HELPER ======
+def get_main_menu():
+    """Create the main menu keyboard"""
     keyboard = [
-        [KeyboardButton("🔍 Search Term"), KeyboardButton("📚 List All Terms")],
+        [KeyboardButton("🔍 Search"), KeyboardButton("📚 List All")],
+        [KeyboardButton("📺 Channels"), KeyboardButton("📊 Statistics")],
         [KeyboardButton("➕ Add Term"), KeyboardButton("🗑️ Delete Term")],
-        [KeyboardButton("ℹ️ Help")],
+        [KeyboardButton("ℹ️ Help")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-async def send_start(update: Update):
-    user_id = update.effective_user.id
-    _user_states.pop(user_id, None)
+# ====== COMMANDS ======
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command"""
     msg = (
-        "🧠 *Flashcard Study Bot*\n\n"
-        "I store terms per-channel and globally. Use the menu or commands.\n\n"
-        "Commands: /addterm, /delete, /listterms, /search, /channels, /stats, /help, /cancel"
+        "📚 *Multi\\-Channel Study Bot*\n\n"
+        "Welcome\\! I help you learn and organize terms and definitions from multiple channels\\.\n\n"
+        "🎯 *Quick Start:*\n"
+        "• Just type any term to search for it\\!\n"
+        "• Use menu buttons for easy navigation\n"
+        "• Add terms directly with simple format\n\n"
+        "📺 *In Channels:*\n"
+        "Post messages in any of these formats:\n"
+        "• `Term \\- Definition`\n"
+        "• `Term: Definition`\n"
+        "• `Term \\= Definition`\n\n"
+        "✨ *Formatting preserved\\!* Your text formatting \\(bold, italic, code\\) will be kept\\.\n\n"
+        "👇 Use the menu below or just start typing\\!"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
+    await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
 
-async def send_help(update: Update):
-    user_id = update.effective_user.id
-    _user_states.pop(user_id, None)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help command with detailed instructions"""
     msg = (
-        "📖 *How to use*\n\n"
-        "*Adding*: /addterm <term> - <definition>\n"
-        "Or tap '➕ Add Term' and send `Term - Definition`.\n\n"
-        "*Searching*: type text or use /search <term>\n"
-        "*Listing*: /listterms (shows global + channel terms)\n"
-        "*Deleting*: /delete <term> or tap '🗑️ Delete Term' and send term name\n\n"
-        "Formatting: MarkdownV2 is supported. Code blocks (```...```) and `inline code` are preserved.\n"
+        "📖 *How to Use This Bot*\n\n"
+        "*🔍 Searching:*\n"
+        "• Just type any term to search\n"
+        "• No commands needed\\!\n"
+        "• Fuzzy matching finds similar terms\n\n"
+        "*➕ Adding Terms:*\n"
+        "1\\. Click 'Add Term' button\n"
+        "2\\. Send term in format: `Term \\- Definition`\n"
+        "3\\. Use *bold*, _italic_, `code` \\- formatting is preserved\\!\n\n"
+        "*📚 Viewing Terms:*\n"
+        "• 'List All' \\- see all saved terms\n"
+        "• 'Channels' \\- view active channels\n"
+        "• 'Statistics' \\- detailed stats\n\n"
+        "*🗑️ Deleting:*\n"
+        "1\\. Click 'Delete Term'\n"
+        "2\\. Type the term name\n\n"
+        "*📺 Channel Learning:*\n"
+        "Add me to channels and I'll learn from posts automatically\\!\n"
+        "Supported formats:\n"
+        "• `Term \\- Definition`\n"
+        "• `Term: Definition`\n"
+        "• `Term \\= Definition`\n\n"
+        "💡 *Pro Tip:* All your text formatting \\(bold, italic, code blocks\\) is preserved\\!"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
+    await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
 
-# ====== COMMAND HANDLERS ======
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_start(update)
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_help(update)
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initiate term adding process"""
     user_id = update.effective_user.id
-    prev = _user_states.pop(user_id, None)
-    if prev:
-        await update.message.reply_text("🛑 Operation canceled.", reply_markup=main_menu_markup())
-    else:
-        await update.message.reply_text("✨ Nothing to cancel.", reply_markup=main_menu_markup())
+    user_states[user_id] = "awaiting_term"
+    
+    msg = (
+        "📝 *Add a New Term*\n\n"
+        "Send me the term and definition in this format:\n"
+        "`Term \\- Definition`\n\n"
+        "✨ You can use:\n"
+        "• *Bold text*\n"
+        "• _Italic text_\n"
+        "• `Code formatting`\n"
+        "• ```Code blocks```\n\n"
+        "*Example:*\n"
+        "`Algorithm \\- A step\\-by\\-step procedure for solving a problem`\n\n"
+        "Send your term now:"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
 
-async def cmd_addterm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /addterm [term - definition]  (if no args: prompt user to send the line)
-    If used in a channel post handler, we will add to the channel KB automatically elsewhere.
-    """
+async def delete_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initiate term deletion process"""
     user_id = update.effective_user.id
-    args = context.args
-    if args:
-        # join args and parse
-        text = " ".join(args)
-        term, definition = parse_term_definition(text)
-        if not term or not definition:
-            await update.message.reply_text("Usage: /addterm Term - Definition (or use the Add Term button).")
+    user_states[user_id] = "awaiting_delete"
+    
+    msg = (
+        "🗑️ *Delete a Term*\n\n"
+        "Type the name of the term you want to delete\\.\n\n"
+        "*Example:* `Algorithm`"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+
+async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search for a term across all channels"""
+    try:
+        query = update.message.text.strip()
+        
+        if not query:
+            await update.message.reply_text(
+                "❌ Please enter a search term\\.",
+                reply_markup=get_main_menu(),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
             return
-        # save into global KB by default for command usage in private chat
-        kb = load_knowledge(None)
-        key = normalize_term(term)
-        kb[key] = {"original_term": term, "definition": definition, "added": datetime.utcnow().isoformat(), "source": "manual"}
-        save_knowledge(kb, None)
+        
+        all_results = []
+        
+        # Search in default knowledge base
+        default_knowledge = load_knowledge()
+        if default_knowledge:
+            default_results = search_knowledge(query, default_knowledge)
+            for term, data, score in default_results:
+                all_results.append((term, data, score, "Manual", 0))
+        
+        # Search in channel knowledge bases
+        knowledge_dir = Path("knowledge_bases")
+        if knowledge_dir.exists():
+            for kb_file in knowledge_dir.glob("knowledge_*.json"):
+                try:
+                    channel_id = int(kb_file.stem.split("_")[1])
+                    knowledge = load_knowledge(channel_id)
+                    
+                    if knowledge:
+                        channel_results = search_knowledge(query, knowledge)
+                        
+                        # Get channel name
+                        first_term = next(iter(knowledge.values()), {})
+                        channel_name = first_term.get("channel", f"Channel {channel_id}")
+                        
+                        for term, data, score in channel_results:
+                            all_results.append((term, data, score, channel_name, channel_id))
+                except Exception as e:
+                    logger.error(f"Error searching {kb_file}: {e}")
+        
+        if not all_results:
+            msg = (
+                f"❌ *No Results Found*\n\n"
+                f"No matches for: *{safe_escape(query)}*\n\n"
+                f"💡 Try:\n"
+                f"• Different keywords\n"
+                f"• Checking spelling\n"
+                f"• Adding the term using 'Add Term' button"
+            )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        
+        # Sort and deduplicate
+        all_results.sort(key=lambda x: x[2], reverse=True)
+        
+        seen_terms = set()
+        unique_results = []
+        for result in all_results:
+            term = result[0]
+            if term not in seen_terms:
+                unique_results.append(result)
+                seen_terms.add(term)
+                if len(unique_results) >= 5:
+                    break
+        
+        # Build response
+        msg = f"🔍 *Search Results for '{safe_escape(query)}'*\n\n"
+        msg += f"Found {len(unique_results)} result{'s' if len(unique_results) != 1 else ''}:\n\n"
+        
+        for i, (term, data, score, channel_name, channel_id) in enumerate(unique_results, 1):
+            original = data.get("original_term", term)
+            
+            msg += f"*{i}\\. {safe_escape(original)}*"
+            if channel_name != "Manual":
+                msg += f" 📺 _{safe_escape(channel_name)}_"
+            msg += "\n"
+            
+            # Handle multiple definitions
+            if "definitions" in data and isinstance(data["definitions"], list):
+                definitions = data["definitions"]
+                for j, def_item in enumerate(definitions[:3], 1):  # Show max 3
+                    if isinstance(def_item, dict):
+                        def_text = def_item.get("text", "")
+                    else:
+                        def_text = str(def_item)
+                    
+                    if len(definitions) > 1:
+                        msg += f"   {j}\\. {def_text}\n"
+                    else:
+                        msg += f"   {def_text}\n"
+                
+                if len(definitions) > 3:
+                    msg += f"   _\\.\\.\\.and {len(definitions) - 3} more_\n"
+            else:
+                definition = data.get("definition", "No definition")
+                msg += f"   {definition}\n"
+            
+            msg += "\n"
+        
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+        
+    except Exception as e:
+        logger.error(f"Error in search_term: {e}", exc_info=True)
         await update.message.reply_text(
-            f"✅ Added *{escape_markdown_v2(term)}* to global KB.",
-            parse_mode=ParseMode.MARKDOWN_V2,
-            reply_markup=main_menu_markup()
-        )
-    else:
-        # prompt user to send the Term - Definition
-        _user_states[user_id] = "awaiting_term"
-        await update.message.reply_text(
-            "📝 Send the term and definition in one message using `Term - Definition` (or `Term: Definition`).",
+            "❌ Error searching\\. Try again\\.",
+            reply_markup=get_main_menu(),
             parse_mode=ParseMode.MARKDOWN_V2
         )
 
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /delete <term> will delete the term from global KB and all channel KBs.
-    If no args: prompt user.
-    """
-    user_id = update.effective_user.id
-    args = context.args
-    if args:
-        term = " ".join(args).strip()
-        if not term:
-            await update.message.reply_text("Usage: /delete <term>")
-            return
-        norm = normalize_term(term)
-        deleted_from = []
-        # global
-        kb = load_knowledge(None)
-        if norm in kb:
-            del kb[norm]
-            save_knowledge(kb, None)
-            deleted_from.append("Global")
-        # channels
-        for cid, _p in get_all_channel_files():
-            ck = load_knowledge(cid)
-            if norm in ck:
-                del ck[norm]
-                save_knowledge(ck, cid)
-                deleted_from.append(f"Channel {cid}")
-        if deleted_from:
-            await update.message.reply_text(
-                f"✅ Deleted *{escape_markdown_v2(term)}* from:\n" + "\n".join(f"• {escape_markdown_v2(x)}" for x in deleted_from),
-                parse_mode=ParseMode.MARKDOWN_V2,
-                reply_markup=main_menu_markup()
+async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all terms from all channels"""
+    try:
+        all_terms = {}
+        
+        # Load default knowledge
+        default_knowledge = load_knowledge()
+        for term, data in default_knowledge.items():
+            if isinstance(data, dict):
+                original = data.get("original_term", term)
+                all_terms[original] = "Manual"
+        
+        # Load channel knowledge
+        knowledge_dir = Path("knowledge_bases")
+        if knowledge_dir.exists():
+            for kb_file in knowledge_dir.glob("knowledge_*.json"):
+                try:
+                    channel_id = int(kb_file.stem.split("_")[1])
+                    knowledge = load_knowledge(channel_id)
+                    
+                    if knowledge:
+                        first_term = next(iter(knowledge.values()), {})
+                        channel_name = first_term.get("channel", f"Channel {channel_id}")
+                        
+                        for term, data in knowledge.items():
+                            if isinstance(data, dict):
+                                original = data.get("original_term", term)
+                                if original not in all_terms:
+                                    all_terms[original] = channel_name
+                except Exception as e:
+                    logger.error(f"Error loading {kb_file}: {e}")
+        
+        if not all_terms:
+            msg = (
+                "📭 *Knowledge Base is Empty*\n\n"
+                "No terms found yet\\!\n\n"
+                "💡 Get started by:\n"
+                "• Clicking 'Add Term' to add manually\n"
+                "• Adding me to a channel as admin"
             )
-        else:
-            await update.message.reply_text("❌ Term not found.")
-    else:
-        _user_states[user_id] = "awaiting_delete"
-        await update.message.reply_text("🗑️ Send the exact term name to delete (global and all channels).")
-
-async def cmd_listterms(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    List terms from global and channels. For private chats, show combined summary.
-    """
-    # gather terms
-    all_terms: Dict[str, List[str]] = {}  # original_term -> list of sources
-    global_kb = load_knowledge(None)
-    for k, v in global_kb.items():
-        orig = v.get("original_term", k)
-        all_terms.setdefault(orig, []).append("Global")
-    for cid, p in get_all_channel_files():
-        ck = load_knowledge(cid)
-        for k, v in ck.items():
-            orig = v.get("original_term", k)
-            all_terms.setdefault(orig, []).append(f"Channel {cid}")
-
-    if not all_terms:
-        await update.message.reply_text("📭 No saved terms yet.", reply_markup=main_menu_markup())
-        return
-
-    # Build output but limit lines to avoid giant messages
-    items = sorted(all_terms.items(), key=lambda x: x[0].lower())
-    lines = []
-    for term, sources in items:
-        src = ", ".join(sources)
-        lines.append(f"• {escape_markdown_v2(term)} — _{escape_markdown_v2(src)}_")
-        if len(lines) >= 100:
-            lines.append(f"_... and {len(items) - 100} more ..._")
-            break
-
-    await update.message.reply_text("📚 *All Terms*\n\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
-
-async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    files = get_all_channel_files()
-    if not files:
-        await update.message.reply_text("No active channel KBs found.", reply_markup=main_menu_markup())
-        return
-    lines = []
-    for cid, path in files:
-        kb = load_knowledge(cid)
-        name = kb[next(iter(kb))].get("channel", f"Channel {cid}") if kb else f"Channel {cid}"
-        lines.append(f"• {escape_markdown_v2(name)} — `{cid}` — {len(kb)} terms")
-    await update.message.reply_text("📺 *Active Channels*\n\n" + "\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
-
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_terms = 0
-    total_definitions = 0
-    global_kb = load_knowledge(None)
-    total_terms += len(global_kb)
-    for v in global_kb.values():
-        if isinstance(v, dict) and "definition" in v:
-            total_definitions += 1
-    for cid, _ in get_all_channel_files():
-        kb = load_knowledge(cid)
-        total_terms += len(kb)
-        for v in kb.values():
-            if isinstance(v, dict) and "definition" in v:
-                total_definitions += 1
-    msg = f"📊 *Statistics*\n\nTotal terms: {total_terms}\nTotal definitions: {total_definitions}\nChannels: {len(get_all_channel_files())}\n"
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
-
-# ====== SEARCH HANDLER ======
-async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    query = " ".join(args).strip() if args else ""
-    if not query:
-        # If user typed just "🔍 Search Term" or similar we'll prompt
-        await update.message.reply_text("Type a word or phrase to search (or use /search <term>).")
-        return
-    results = search_all(query, include_global=True, channel_scan=True, max_results=10)
-    if not results:
-        await update.message.reply_text(f"❌ No results for *{escape_markdown_v2(query)}*.", parse_mode=ParseMode.MARKDOWN_V2)
-        return
-
-    lines = [f"🔍 *Search results for* _{escape_markdown_v2(query)}_\n"]
-    for i, (term_norm, data, score, cid) in enumerate(results, 1):
-        orig = data.get("original_term", term_norm)
-        definition = data.get("definition", "")
-        source = "Global" if cid is None else f"Channel {cid}"
-        lines.append(f"*{i}. {escape_markdown_v2(orig)}*  _({escape_markdown_v2(source)})_")
-        # truncate definition to reasonable length
-        display_def = (definition[:300] + "...") if len(definition) > 300 else definition
-        lines.append(f"   {escape_markdown_v2(display_def)}\n")
-        if len(lines) >= 40:
-            break
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
-
-# ====== CHANNEL POST HANDLER ======
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Auto-detect Term - Definition in channel posts and add to that channel's KB.
-    Uses parse_term_definition on channel_post.text.
-    """
-    msg = update.channel_post
-    if not msg or not msg.text:
-        return
-    cid = msg.chat.id
-    text = msg.text.strip()
-    term, definition = parse_term_definition(text)
-    if not term or not definition:
-        # Not a term-definition formatted post; ignore
-        return
-    kb = load_knowledge(cid)
-    key = normalize_term(term)
-    timestamp = str(msg.date) if hasattr(msg, "date") else datetime.utcnow().isoformat()
-    # keep original formatting inside definition
-    kb[key] = {
-        "original_term": term,
-        "definition": definition,
-        "added": timestamp,
-        "channel": msg.chat.title if msg.chat and msg.chat.title else f"Channel {cid}",
-        "source": "channel"
-    }
-    save_knowledge(kb, cid)
-    logger.info(f"[Channel {cid}] Added term: {term}")
-
-# ====== PRIVATE MESSAGE / MENU HANDLER ======
-async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles private chat messages and menu button presses.
-    State machine for awaiting_term and awaiting_delete.
-    """
-    user_id = update.effective_user.id
-    if not update.message or not update.message.text:
-        return
-    text = update.message.text.strip()
-
-    # Menu shortcuts handling (strings from keyboard)
-    if text == "🔍 Search Term":
-        await update.message.reply_text("🔍 Type your search phrase or use /search <term>.", reply_markup=main_menu_markup())
-        return
-    if text == "📚 List All Terms":
-        await cmd_listterms(update, context)
-        return
-    if text == "➕ Add Term":
-        _user_states[user_id] = "awaiting_term"
-        await update.message.reply_text("📝 Send the term and definition as `Term - Definition`.", parse_mode=ParseMode.MARKDOWN_V2)
-        return
-    if text == "🗑️ Delete Term":
-        _user_states[user_id] = "awaiting_delete"
-        await update.message.reply_text("🗑️ Send the exact term name to delete (global + all channels).")
-        return
-    if text == "ℹ️ Help":
-        await send_help(update)
-        return
-
-    # If user in awaiting_term state
-    state = _user_states.get(user_id)
-    if state == "awaiting_term":
-        term, definition = parse_term_definition(text)
-        if not term or not definition:
-            await update.message.reply_text("Couldn't parse. Send in format `Term - Definition`.")
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
             return
-        kb = load_knowledge(None)
-        key = normalize_term(term)
-        kb[key] = {
-            "original_term": term,
-            "definition": definition,
-            "added": datetime.utcnow().isoformat(),
-            "source": "manual"
-        }
-        save_knowledge(kb, None)
-        _user_states[user_id] = None
-        await update.message.reply_text(f"✅ Added *{escape_markdown_v2(term)}* to Global.", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
-        return
+        
+        sorted_terms = sorted(all_terms.items())
+        
+        msg = f"📚 *All Terms* \\({len(sorted_terms)} total\\)\n\n"
+        
+        # Group by source
+        manual_terms = [(t, s) for t, s in sorted_terms if s == "Manual"]
+        channel_terms = [(t, s) for t, s in sorted_terms if s != "Manual"]
+        
+        if manual_terms:
+            msg += "*Manual Terms:*\n"
+            for term, _ in manual_terms[:20]:
+                msg += f"• {safe_escape(term)}\n"
+            if len(manual_terms) > 20:
+                msg += f"_\\.\\.\\.and {len(manual_terms) - 20} more_\n"
+            msg += "\n"
+        
+        if channel_terms:
+            # Group by channel
+            from itertools import groupby
+            channel_terms_sorted = sorted(channel_terms, key=lambda x: x[1])
+            
+            for channel, terms in groupby(channel_terms_sorted, key=lambda x: x[1]):
+                terms_list = list(terms)
+                msg += f"*{safe_escape(channel)}:*\n"
+                for term, _ in terms_list[:15]:
+                    msg += f"• {safe_escape(term)}\n"
+                if len(terms_list) > 15:
+                    msg += f"_\\.\\.\\.and {len(terms_list) - 15} more_\n"
+                msg += "\n"
+        
+        msg += "💡 Type any term name to search for it\\!"
+        
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+        
+    except Exception as e:
+        logger.error(f"Error in list_terms: {e}", exc_info=True)
+        await update.message.reply_text("❌ Error listing terms", reply_markup=get_main_menu())
 
-    if state == "awaiting_delete":
-        term = text
-        norm = normalize_term(term)
-        deleted = []
-        g = load_knowledge(None)
-        if norm in g:
-            del g[norm]
-            save_knowledge(g, None)
-            deleted.append("Global")
-        for cid, _ in get_all_channel_files():
-            ck = load_knowledge(cid)
-            if norm in ck:
-                del ck[norm]
-                save_knowledge(ck, cid)
-                deleted.append(f"Channel {cid}")
-        _user_states[user_id] = None
-        if deleted:
-            await update.message.reply_text("✅ Deleted from:\n" + "\n".join(f"• {x}" for x in deleted), reply_markup=main_menu_markup())
-        else:
-            await update.message.reply_text("❌ Term not found.", reply_markup=main_menu_markup())
-        return
+async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show all channels the bot is learning from"""
+    try:
+        channels = get_all_channels()
+        
+        if not channels:
+            msg = (
+                "📭 *No Active Channels*\n\n"
+                "Add me to a channel to start learning\\!\n\n"
+                "📌 *How to add me:*\n"
+                "1\\. Go to your channel\n"
+                "2\\. Channel Settings → Administrators\n"
+                "3\\. Add this bot as admin\n"
+                "4\\. Post terms: `Term \\- Definition`\n\n"
+                "✨ I'll learn automatically\\!"
+            )
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        
+        msg = f"📺 *Active Channels* \\({len(channels)}\\)\n\n"
+        
+        for i, (channel_id, channel_name, term_count) in enumerate(channels, 1):
+            msg += f"*{i}\\. {safe_escape(channel_name)}*\n"
+            msg += f"   📚 {term_count} term{'s' if term_count != 1 else ''}\n"
+            msg += f"   🆔 `{channel_id}`\n\n"
+        
+        msg += "💡 Add me to more channels to expand the knowledge base\\!"
+        
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+        
+    except Exception as e:
+        logger.error(f"Error in show_channels: {e}", exc_info=True)
+        await update.message.reply_text("❌ Error showing channels", reply_markup=get_main_menu())
 
-    # If not special state: treat as search
-    # This is friendly: typing any word searches across KBs
-    results = search_all(text, include_global=True, channel_scan=True, max_results=8)
-    if not results:
-        await update.message.reply_text(f"❌ No results for *{escape_markdown_v2(text)}*.", parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
-        return
-    lines = [f"🔍 *Search results for* _{escape_markdown_v2(text)}_\n"]
-    for i, (term_norm, data, score, cid) in enumerate(results, 1):
-        orig = data.get("original_term", term_norm)
-        definition = data.get("definition", "")
-        source = "Global" if cid is None else f"Channel {cid}"
-        lines.append(f"*{i}. {escape_markdown_v2(orig)}*  _({escape_markdown_v2(source)})_")
-        lines.append(f"   {escape_markdown_v2(definition[:300] + ('...' if len(definition) > 300 else ''))}\n")
-        if len(lines) >= 40:
-            break
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN_V2, reply_markup=main_menu_markup())
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show overall statistics"""
+    try:
+        total_terms = 0
+        total_definitions = 0
+        total_channels = 0
+        
+        # Count default knowledge
+        default_knowledge = load_knowledge()
+        if default_knowledge:
+            total_terms += len(default_knowledge)
+            for data in default_knowledge.values():
+                if isinstance(data, dict):
+                    if "definitions" in data:
+                        total_definitions += len(data["definitions"])
+                    elif "definition" in data:
+                        total_definitions += 1
+        
+        # Count channel knowledge
+        knowledge_dir = Path("knowledge_bases")
+        if knowledge_dir.exists():
+            channel_files = list(knowledge_dir.glob("knowledge_*.json"))
+            total_channels = len(channel_files)
+            
+            for kb_file in channel_files:
+                try:
+                    channel_id = int(kb_file.stem.split("_")[1])
+                    knowledge = load_knowledge(channel_id)
+                    
+                    total_terms += len(knowledge)
+                    for data in knowledge.values():
+                        if isinstance(data, dict):
+                            if "definitions" in data:
+                                total_definitions += len(data["definitions"])
+                            elif "definition" in data:
+                                total_definitions += 1
+                except Exception as e:
+                    logger.error(f"Error processing {kb_file}: {e}")
+        
+        msg = "📊 *Knowledge Base Statistics*\n\n"
+        msg += f"📺 Active Channels: *{total_channels}*\n"
+        msg += f"📚 Total Terms: *{total_terms}*\n"
+        msg += f"📝 Total Definitions: *{total_definitions}*\n"
+        
+        if total_terms > 0:
+            avg = total_definitions / total_terms
+            msg += f"📈 Average: *{avg:.1f}* def/term\n"
+        
+        msg += f"\n💡 Keep learning\\! Your knowledge base is growing\\."
+        
+        await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+        
+    except Exception as e:
+        logger.error(f"Error in stats: {e}", exc_info=True)
+        await update.message.reply_text("❌ Error getting statistics", reply_markup=get_main_menu())
 
-# ====== ERROR HANDLER ======
-async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Update caused error", exc_info=context.error)
+async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Automatically extract terms from channel messages - preserves formatting"""
+    try:
+        if not update.channel_post:
+            return
+        
+        channel_id = update.channel_post.chat.id
+        channel_name = update.channel_post.chat.title or update.channel_post.chat.username or f"Channel {channel_id}"
+        
+        text = update.channel_post.text or update.channel_post.caption
+        entities = update.channel_post.entities or update.channel_post.caption_entities
+        
+        if not text:
+            return
+        
+        term, definition, _ = extract_definition(text, entities)
+        
+        if term and definition:
+            knowledge = load_knowledge(channel_id)
+            term_norm = normalize_term(term)
+            
+            timestamp = str(update.channel_post.date)
+            
+            if term_norm in knowledge:
+                # Add to existing term
+                if "definitions" not in knowledge[term_norm]:
+                    old_def = knowledge[term_norm].get("definition", "")
+                    old_added = knowledge[term_norm].get("added", timestamp)
+                    knowledge[term_norm]["definitions"] = [{"text": old_def, "added": old_added}]
+                
+                knowledge[term_norm]["definitions"].append({
+                    "text": definition,
+                    "added": timestamp,
+                    "channel": channel_name
+                })
+                logger.info(f"[{channel_name}] Added definition #{len(knowledge[term_norm]['definitions'])} for term: {term}")
+            else:
+                # Create new term
+                knowledge[term_norm] = {
+                    "original_term": term,
+                    "definitions": [{"text": definition, "added": timestamp, "channel": channel_name}],
+                    "added": timestamp,
+                    "channel": channel_name,
+                    "related": []
+                }
+                logger.info(f"[{channel_name}] Auto-learned new term: {term}")
+            
+            save_knowledge(knowledge, channel_id)
+        
+    except Exception as e:
+        logger.error(f"Error handling channel message: {e}", exc_info=True)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle direct messages based on user state"""
+    try:
+        if not update.message or not update.message.text:
+            return
+        
+        if update.message.text.startswith('/'):
+            return
+        
+        user_id = update.effective_user.id
+        text = update.message.text.strip()
+        
+        # Check user state
+        user_state = user_states.get(user_id)
+        
+        # Handle menu button clicks
+        if text == "🔍 Search":
+            msg = "🔍 Just type the term you're looking for\\!\n\nI'll search across all channels\\."
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        
+        elif text == "📚 List All":
+            await list_terms(update, context)
+            return
+        
+        elif text == "📺 Channels":
+            await show_channels(update, context)
+            return
+        
+        elif text == "📊 Statistics":
+            await stats(update, context)
+            return
+        
+        elif text == "➕ Add Term":
+            await add_term(update, context)
+            return
+        
+        elif text == "🗑️ Delete Term":
+            await delete_term(update, context)
+            return
+        
+        elif text == "ℹ️ Help":
+            await help_command(update, context)
+            return
+        
+        # Handle state-based inputs
+        if user_state == "awaiting_term":
+            # User is adding a term
+            term, definition, _ = extract_definition(text, update.message.entities)
+            
+            if not term or not definition:
+                msg = (
+                    "❌ I couldn't parse that\\.\n\n"
+                    "Please use format: `Term \\- Definition`\n\n"
+                    "Examples:\n"
+                    "• `Algorithm \\- Step\\-by\\-step procedure`\n"
+                    "• `Python: Programming language`\n"
+                    "• `API \\= Application Programming Interface`"
+                )
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+                return
+            
+            knowledge = load_knowledge()
+            term_norm = normalize_term(term)
+            timestamp = str(update.message.date)
+            
+            if term_norm in knowledge:
+                # Add to existing term
+                if "definitions" not in knowledge[term_norm]:
+                    old_def = knowledge[term_norm].get("definition", "")
+                    old_added = knowledge[term_norm].get("added", timestamp)
+                    knowledge[term_norm]["definitions"] = [{"text": old_def, "added": old_added}]
+                
+                knowledge[term_norm]["definitions"].append({
+                    "text": definition,
+                    "added": timestamp,
+                    "source": "manual"
+                })
+                
+                msg = f"✅ *Added Another Definition\\!*\n\n"
+                msg += f"📚 *{safe_escape(term)}*\n"
+                msg += f"📊 Now has {len(knowledge[term_norm]['definitions'])} definitions"
+            else:
+                # Create new term
+                knowledge[term_norm] = {
+                    "original_term": term,
+                    "definitions": [{"text": definition, "added": timestamp, "source": "manual"}],
+                    "added": timestamp,
+                    "related": []
+                }
+                
+                msg = f"✅ *Term Added Successfully\\!*\n\n"
+                msg += f"📚 *{safe_escape(term)}*\n"
+                msg += f"{definition}"
+            
+            save_knowledge(knowledge)
+            user_states[user_id] = None
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+            logger.info(f"Manual add - term: {term}")
+            return
+        
+        elif user_state == "awaiting_delete":
+            # User is deleting a term
+            term = text
+            term_norm = normalize_term(term)
+            deleted_from = []
+            
+            # Delete from default knowledge
+            default_knowledge = load_knowledge()
+            if term_norm in default_knowledge:
+                original = default_knowledge[term_norm].get("original_term", term)
+                del default_knowledge[term_norm]
+                save_knowledge(default_knowledge)
+                deleted_from.append("Manual")
+            
+            # Delete from channel knowledge bases
+            knowledge_dir = Path("knowledge_bases")
+            if knowledge_dir.exists():
+                for kb_file in knowledge_dir.glob("knowledge_*.json"):
+                    try:
+                        channel_id = int(kb_file.stem.split("_")[1])
+                        knowledge = load_knowledge(channel_id)
+                        
+                        if term_norm in knowledge:
+                            original = knowledge[term_norm].get("original_term", term)
+                            channel_name = knowledge[term_norm].get("channel", f"Channel {channel_id}")
+                            del knowledge[term_norm]
+                            save_knowledge(knowledge, channel_id)
+                            deleted_from.append(channel_name)
+                    except Exception as e:
+                        logger.error(f"Error processing {kb_file}: {e}")
+            
+            if deleted_from:
+                msg = f"✅ *Term Deleted\\!*\n\n"
+                msg += f"🗑️ Removed '*{safe_escape(term)}*' from:\n"
+                for source in deleted_from:
+                    msg += f"   • {safe_escape(source)}\n"
+                logger.info(f"Deleted term: {term} from {', '.join(deleted_from)}")
+            else:
+                msg = f"❌ *Term Not Found*\n\n'{safe_escape(term)}' doesn't exist in the knowledge base\\."
+            
+            user_states[user_id] = None
+            await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+            return
+        
+        # If not in a special state and not a menu button, treat as search
+        await search_term(update, context)
+        
+    except Exception as e:
+        logger.error(f"Error handling message: {e}", exc_info=True)
+        user_states.pop(user_id, None)
+        await update.message.reply_text(
+            "❌ An error occurred\\. Please try again\\.",
+            reply_markup=get_main_menu(),
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
+
+# ====== GRACEFUL SHUTDOWN ======
+def signal_handler(sig, frame):
+    """Handle shutdown signals"""
+    logger.info("Received shutdown signal, stopping bot...")
+    if app and app.running:
+        app.stop()
+    sys.exit(0)
 
 # ====== MAIN ======
 def main():
-    app = Application.builder().token(TOKEN).build()
+    """Main function to run the bot"""
+    global app
+    
+    logger.info("Starting enhanced multi-channel study bot...")
+    
+    try:
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Create application
+        app = Application.builder().token(TOKEN).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("addterm", cmd_addterm))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("listterms", cmd_listterms))
-    app.add_handler(CommandHandler("channels", cmd_channels))
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("search", cmd_search))
+        # Add command handlers
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("add", add_term))
+        app.add_handler(CommandHandler("search", search_term))
+        app.add_handler(CommandHandler("list", list_terms))
+        app.add_handler(CommandHandler("channels", show_channels))
+        app.add_handler(CommandHandler("delete", delete_term))
+        app.add_handler(CommandHandler("stats", stats))
 
-    # Channel posts (auto-ingest)
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.CHANNEL, handle_channel_post))
+        # Handle channel posts
+        app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_message))
+        
+        # Handle direct messages
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_message))
 
-    # Private messages / menu buttons / typed queries
-    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_private_message))
+        # Add error handler
+        app.add_error_handler(error_handler)
 
-    app.add_error_handler(on_error)
-
-    logger.info("Starting multi-channel flashcard bot...")
-    # allow channel_post events as well as message
-    app.run_polling(drop_pending_updates=True, allowed_updates=["message", "channel_post"])
+        # Set bot commands for menu
+        commands = [
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "Show help message"),
+            BotCommand("search", "Search for a term"),
+            BotCommand("add", "Add a new term"),
+            BotCommand("list", "List all terms"),
+            BotCommand("channels", "Show active channels"),
+            BotCommand("delete", "Delete a term"),
+            BotCommand("stats", "Show statistics")
+        ]
+        
+        # Start the bot
+        logger.info("Enhanced multi-channel study bot started successfully")
+        logger.info("Bot is ready to receive messages...")
+        
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=["message", "channel_post"]
+        )
+        
+    except Exception as e:
+        logger.error(f"Error running bot: {e}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     main()
