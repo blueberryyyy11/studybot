@@ -151,6 +151,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Click *'🔍 Search Term'* or just type a keyword to find a term or definition\\.\n\n"
         "👇 Use the menu below or just start typing to search\\!"
     )
+    # Ensure state is reset on start
+    user_states.pop(update.effective_user.id, None) 
     await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -172,8 +174,23 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• *'📚 List All Terms'* shows all saved flashcards\\.\n\n"
         "*🗑️ Deleting:*\n"
         "1\\. Click *'🗑️ Delete Term'*\\.\n"
-        "2\\. Type the exact name of the term to remove it\\."
+        "2\\. Type the exact name of the term to remove it\\.\n\n"
+        "*🛑 Canceling:*\n"
+        "• Type `/cancel` to stop any pending operation (Add/Delete)\\."
     )
+    user_states.pop(update.effective_user.id, None) 
+    await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel any ongoing multi-step operation and reset the user state."""
+    user_id = update.effective_user.id
+    current_state = user_states.pop(user_id, None)
+    
+    if current_state:
+        msg = "🛑 *Canceled*\\! The previous operation was successfully stopped\\."
+    else:
+        msg = "✨ Nothing to cancel\\! You are currently not in any multi\\-step operation\\."
+        
     await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def add_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,6 +254,7 @@ async def search_term(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logger.error(f"Error in search_term: {e}")
+        # Note: Do NOT clear state here, as search is the default state
         await update.message.reply_text("❌ Error searching for terms\\. Try again\\.", reply_markup=get_main_menu(), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,6 +296,7 @@ async def list_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle direct messages based on user state."""
+    user_id = update.effective_user.id
     try:
         if not update.message or not update.message.text:
             return
@@ -285,11 +304,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message.text.startswith('/'):
             return
         
-        user_id = update.effective_user.id
         text = update.message.text.strip()
         user_state = user_states.get(user_id)
         
-        # Handle menu button clicks
+        # Handle menu button clicks - always clear state for menu buttons before proceeding
+        # This prevents accidental state persistence if an error occurred during a previous action.
+        
         if text == "🔍 Search Term":
             user_states[user_id] = None
             msg = "🔍 Just type the term or keyword you're looking for\\!\n\nFor example: `API` or `programming language`"
@@ -302,10 +322,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         elif text == "➕ Add Term":
+            user_states[user_id] = None # Reset state, then call add_term which sets it to awaiting_term
             await add_term(update, context)
             return
         
         elif text == "🗑️ Delete Term":
+            user_states[user_id] = None # Reset state, then call delete_term which sets it to awaiting_delete_term
             await delete_term(update, context)
             return
         
@@ -330,6 +352,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             terms = load_terms()
             term_norm = normalize_name(term_details["term"])
             
+            # Check for existing term
+            if term_norm in terms:
+                msg = (
+                    f"⚠️ *Term Already Exists*\\!\\n\\n"
+                    f"The term '*{escape_markdown(term_details['term'])}*' is already in your flashcards\\.\n"
+                    f"To replace it, please use the format again or type `/cancel`\\."
+                )
+                # DO NOT clear state here, allow the user to immediately send the input again to overwrite
+                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+                return
+            
             terms[term_norm] = {
                 "original_term": term_details["term"],
                 "definition": term_details["definition"],
@@ -337,7 +370,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             
             save_terms(terms)
-            user_states[user_id] = None
+            user_states[user_id] = None # Clear state upon success
             
             msg = f"✅ *Term Added Successfully\\!*\n\n"
             msg += f"*{escape_markdown(term_details['term'])}*\n"
@@ -361,11 +394,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             terms = load_terms()
             
             if name_norm in terms:
+                original_term = terms[name_norm].get("original_term", name)
                 del terms[name_norm]
                 save_terms(terms)
                 
                 msg = f"✅ *Term Deleted\\!*\n\n"
-                msg += f"🗑️ Removed '*{escape_markdown(name)}*' from your flashcards\\."
+                msg += f"🗑️ Removed '*{escape_markdown(original_term)}*' from your flashcards\\."
                 logger.info(f"Deleted term: {name}")
             else:
                 msg = f"❌ *Term Not Found*\n\n'*{escape_markdown(name)}*' doesn't exist in your flashcards\\."
@@ -379,9 +413,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         logger.error(f"Error handling message: {e}")
+        # Remove the state only if an error occurred during a multi-step process
         user_states.pop(user_id, None)
         await update.message.reply_text(
-            "❌ An error occurred\\. Please try again\\.",
+            "❌ An internal error occurred\\. Your current operation has been canceled\\. Please try again\\.",
             reply_markup=get_main_menu(),
             parse_mode=ParseMode.MARKDOWN_V2
         )
@@ -405,6 +440,7 @@ def main():
         # Add command handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("help", help_command))
+        app.add_handler(CommandHandler("cancel", cancel_command)) # NEW CANCEL COMMAND
         app.add_handler(CommandHandler("add", add_term))
         app.add_handler(CommandHandler("delete", delete_term))
         app.add_handler(CommandHandler("list", list_terms))
