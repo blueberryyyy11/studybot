@@ -305,6 +305,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         text = update.message.text.strip()
+        if not text:
+            return
         user_state = user_states.get(user_id)
         
         # Handle menu button clicks - always clear state for menu buttons before proceeding
